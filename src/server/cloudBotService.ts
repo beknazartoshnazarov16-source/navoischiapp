@@ -484,6 +484,7 @@ export class CloudTelegramBot {
             { command: 'monitoring', description: '📢 6 soatlik monitoring (Admin)' },
             { command: 'eslatma', description: '🔔 Aqlli eslatmalar (Admin)' },
             { command: 'portal', description: '🌐 Veb-portal (Mini App)' },
+            { command: 'oraliq', description: '📅 Sanalar oralig\'i hisoboti' },
             { command: 'yordam', description: 'ℹ️ Yordam va yo\'riqnoma' },
           ];
 
@@ -857,6 +858,15 @@ export class CloudTelegramBot {
       }
     } else if (cleanCmd === '/bugun' || cleanCmd === 'bugun') {
       await this.handleTodaySummary(chatId, tgUserId, isAdm);
+    } else if (
+      cleanCmd.startsWith('/oraliq') ||
+      cleanCmd.startsWith('/davr') ||
+      cleanCmd.startsWith('/range') ||
+      cleanCmd === 'oraliq' ||
+      cleanCmd === 'davr' ||
+      cleanCmd === 'range'
+    ) {
+      await this.handleDateRangeReport(chatId, tgUserId, isAdm, rawText);
     } else if (
       cleanCmd === '/app' ||
       cleanCmd === '/webapp' ||
@@ -1790,6 +1800,143 @@ export class CloudTelegramBot {
         text += `• ${a.check_in_time.slice(0, 5)} ➡️ ${outT} (${wStr})\n`;
       });
       text += `\n📊 <b>Bugun jami:</b> <b>${formatMinutes(totalM)}</b>`;
+
+      await this.sendMessage(chatId, text);
+    }
+  }
+
+  private parseDateToIso(dateStr: string): string {
+    const cleaned = dateStr.replace(/\./g, '-').replace(/\//g, '-');
+    const parts = cleaned.split('-');
+    if (parts.length === 3) {
+      if (parts[0].length === 4) {
+        return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+      } else {
+        return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+      }
+    }
+    return getTashkentDateString(getTashkentNow());
+  }
+
+  private async handleDateRangeReport(chatId: number, tgUserId: string, isAdm: boolean, rawText: string) {
+    const textBody = rawText.replace(/\/oraliq|\/davr|\/range|oraliq|davr|range/gi, '').trim();
+    const dates = textBody.match(/(\d{2}[./]\d{2}[./]\d{4}|\d{4}[./]\d{2}[./]\d{2})/g);
+    const now = getTashkentNow();
+    let startDate: string;
+    let endDate: string;
+
+    if (dates && dates.length >= 2) {
+      startDate = this.parseDateToIso(dates[0]);
+      endDate = this.parseDateToIso(dates[1]);
+    } else if (dates && dates.length === 1) {
+      startDate = this.parseDateToIso(dates[0]);
+      endDate = getTashkentDateString(now);
+    } else {
+      const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      startDate = getTashkentDateString(lastMonth);
+      endDate = getTashkentDateString(now);
+    }
+
+    if (!startDate || !endDate) {
+      await this.sendMessage(chatId, "❌ Sana formati noto'g'ri! Misol:\n<code>/oraliq 01.09.2026 15.10.2026</code>");
+      return;
+    }
+
+    if (startDate > endDate) {
+      const temp = startDate;
+      startDate = endDate;
+      endDate = temp;
+    }
+
+    const usersSnap = await getDocs(collection(db, 'users'));
+    const userMap = new Map<number, User>();
+    usersSnap.forEach((d) => {
+      const u = d.data() as User;
+      userMap.set(u.id, u);
+    });
+
+    const attSnap = await getDocs(
+      query(collection(db, 'attendance'), where('status', '==', 'completed'))
+    );
+
+    if (isAdm) {
+      const workers: User[] = [];
+      userMap.forEach((u) => {
+        if (u.role === 'worker') workers.push(u);
+      });
+
+      const statsByUser = new Map<number, { mins: number; days: Set<string>; shifts: number }>();
+      let totalStoreMins = 0;
+
+      attSnap.forEach((d) => {
+        const a = d.data() as Attendance;
+        if (a.date >= startDate && a.date <= endDate) {
+          const st = statsByUser.get(a.user_id) || { mins: 0, days: new Set(), shifts: 0 };
+          const mins = getAccurateAttendanceMinutes(a);
+          st.mins += mins;
+          st.days.add(a.date);
+          st.shifts += 1;
+          statsByUser.set(a.user_id, st);
+          totalStoreMins += mins;
+        }
+      });
+
+      let text = `📊 <b>SANALAR ORALIG'I HISOBOTI</b>\n` +
+                 `📅 Davr: <b>${startDate} dan ${endDate} gacha</b>\n` +
+                 `━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      workers.forEach((w) => {
+        const st = statsByUser.get(w.id) || { mins: 0, days: new Set(), shifts: 0 };
+        text += `👤 <b>${escapeHtml(w.full_name)}</b> (${escapeHtml(w.position || 'Xodim')})\n` +
+                `   • Ishlagan kunlari: <b>{days} kun</b> ({shifts} ta smena)\n` +
+                `   • Jami ishlagan vaqti: <b>{worked}</b> ({hours} soat)\n\n`;
+        text = text
+          .replace('{days}', String(st.days.size))
+          .replace('{shifts}', String(st.shifts))
+          .replace('{worked}', formatMinutes(st.mins))
+          .replace('{hours}', (st.mins / 60).toFixed(1));
+      });
+
+      text += `━━━━━━━━━━━━━━━━━━━\n` +
+              `🏪 <b>Jami do'kon bo'yicha:</b> <b>${formatMinutes(totalStoreMins)}</b> (${(totalStoreMins / 60).toFixed(1)} soat)`;
+
+      await this.sendMessage(chatId, text);
+    } else {
+      const user = await this.findUserByTelegramId(tgUserId);
+      if (!user) {
+        await this.sendMessage(chatId, `Iltimos, avval ro'yxatdan o'ting (/start).`);
+        return;
+      }
+
+      const userShifts: Attendance[] = [];
+      attSnap.forEach((d) => {
+        const a = d.data() as Attendance;
+        if (a.user_id === user.id && a.date >= startDate && a.date <= endDate) {
+          userShifts.push(a);
+        }
+      });
+
+      userShifts.sort((a, b) => b.id - a.id);
+      const totalMins = userShifts.reduce((acc, s) => acc + getAccurateAttendanceMinutes(s), 0);
+      const uniqueDays = new Set(userShifts.map((s) => s.date)).size;
+
+      let text = `📊 <b>${escapeHtml(user.full_name)} ning hisoboti:</b>\n` +
+                 `📅 Davr: <b>${startDate} — ${endDate}</b>\n\n` +
+                 `📅 Kelgan kunlar: <b>{days} kun</b> ({shifts} ta smena)\n` +
+                 `⏱ <b>JAMI ISHLANGAN VAQT:</b> <b>{worked}</b> ({hours} soat)\n\n`;
+      text = text
+        .replace('{days}', String(uniqueDays))
+        .replace('{shifts}', String(userShifts.length))
+        .replace('{worked}', formatMinutes(totalMins))
+        .replace('{hours}', (totalMins / 60).toFixed(1));
+
+      if (userShifts.length > 0) {
+        text += `Smenalar:\n`;
+        for (const s of userShifts.slice(0, 10)) {
+          const outT = s.check_out_time ? s.check_out_time.slice(0, 5) : '---';
+          text += `• ${s.date}: ${s.check_in_time.slice(0, 5)} ➡️ ${outT} (${formatMinutes(getAccurateAttendanceMinutes(s))})\n`;
+        }
+      }
 
       await this.sendMessage(chatId, text);
     }

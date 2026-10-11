@@ -1318,6 +1318,113 @@ def handle_today_summary(message):
             text += f"\n📊 <b>Bugun jami:</b> <b>{format_minutes(total_m)}</b>"
             bot.send_message(message.chat.id, text, parse_mode="HTML")
 
+# --- SANALAR ORALIG'I HISOBOTI (/oraliq 01.09.2026 15.10.2026) ---
+@bot.message_handler(commands=['oraliq', 'davr', 'range'])
+def handle_date_range_report(message):
+    tg_id = str(message.from_user.id)
+    text_body = message.text.replace("/oraliq", "").replace("/davr", "").replace("/range", "").strip()
+    
+    dates = re.findall(r'(\d{2}[./]\d{2}[./]\d{4}|\d{4}[./]\d{2}[./]\d{2})', text_body)
+    now = get_uz_now()
+    
+    if len(dates) >= 2:
+        start_str_raw, end_str_raw = dates[0], dates[1]
+    elif len(dates) == 1:
+        start_str_raw = dates[0]
+        end_str_raw = now.strftime("%d.%m.%Y")
+    else:
+        # Default: o'tgan oyning 1-chi sanasidan bugungacha
+        first_last_month = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+        start_str_raw = first_last_month.strftime("%d.%m.%Y")
+        end_str_raw = now.strftime("%d.%m.%Y")
+        
+    def parse_to_iso(d_str):
+        for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(d_str, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return None
+
+    start_iso = parse_to_iso(start_str_raw)
+    end_iso = parse_to_iso(end_str_raw)
+    
+    if not start_iso or not end_iso:
+        bot.reply_to(message, "❌ Sana formati noto'g'ri! Misol:\n<code>/oraliq 01.09.2026 15.10.2026</code>", parse_mode="HTML")
+        return
+        
+    if start_iso > end_iso:
+        start_iso, end_iso = end_iso, start_iso
+
+    is_adm = is_user_admin(tg_id)
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if is_adm:
+            cursor.execute("SELECT id, full_name, position FROM workers WHERE is_active = 1")
+            workers = cursor.fetchall()
+            
+            cursor.execute("""
+                SELECT worker_id, check_in_time, check_out_time, worked_minutes
+                FROM attendance
+                WHERE status = 'completed' AND SUBSTR(check_in_time, 1, 10) >= ? AND SUBSTR(check_in_time, 1, 10) <= ?
+            """, (start_iso, end_iso))
+            rows = cursor.fetchall()
+            
+            report = f"📊 <b>SANALAR ORALIG'I HISOBOTI</b>\n" \
+                     f"📅 Davr: <b>{start_iso} dan {end_iso} gacha</b>\n" \
+                     f"━━━━━━━━━━━━━━━━━━━\n\n"
+            
+            total_store_mins = 0
+            worker_stats = {}
+            for r in rows:
+                w_id, c_in, c_out, w_mins = r
+                if w_id not in worker_stats:
+                    worker_stats[w_id] = {"mins": 0, "days": set(), "shifts": 0}
+                worker_stats[w_id]["mins"] += (w_mins or 0)
+                worker_stats[w_id]["shifts"] += 1
+                worker_stats[w_id]["days"].add(c_in[:10])
+                total_store_mins += (w_mins or 0)
+                
+            for w_id, name, pos in workers:
+                st = worker_stats.get(w_id, {"mins": 0, "days": set(), "shifts": 0})
+                mins = st["mins"]
+                days = len(st["days"])
+                shifts_count = st["shifts"]
+                report += f"👤 <b>{html.escape(name)}</b> ({html.escape(pos or 'Xodim')})\n" \
+                          f"   • Ishlagan kunlari: <b>{days} kun</b> ({shifts_count} ta smena)\n" \
+                          f"   • Jami ishlagan vaqti: <b>{format_minutes(mins)}</b> ({round(mins/60, 1)} soat)\n\n"
+                          
+            report += f"━━━━━━━━━━━━━━━━━━━\n" \
+                      f"🏪 <b>Jami do'kon bo'yicha:</b> <b>{format_minutes(total_store_mins)}</b> ({round(total_store_mins/60, 1)} soat)"
+            bot.send_message(message.chat.id, report, parse_mode="HTML")
+        else:
+            cursor.execute("SELECT id, full_name FROM workers WHERE telegram_id = ?", (tg_id,))
+            w = cursor.fetchone()
+            if not w:
+                bot.send_message(message.chat.id, "Iltimos, avval ro'yxatdan o'ting (/start).")
+                return
+            w_id, w_name = w[0], w[1]
+            cursor.execute("""
+                SELECT check_in_time, check_out_time, worked_minutes
+                FROM attendance
+                WHERE worker_id = ? AND status = 'completed' AND SUBSTR(check_in_time, 1, 10) >= ? AND SUBSTR(check_in_time, 1, 10) <= ?
+                ORDER BY id DESC
+            """, (w_id, start_iso, end_iso))
+            rows = cursor.fetchall()
+            total_mins = sum(r[2] for r in rows) if rows else 0
+            unique_days = len(set(r[0][:10] for r in rows)) if rows else 0
+            
+            report = f"📊 <b>{html.escape(w_name)} ning hisoboti:</b>\n" \
+                     f"📅 Davr: <b>{start_iso} — {end_iso}</b>\n\n" \
+                     f"📅 Kelgan kunlar: <b>{unique_days} kun</b> ({len(rows)} ta smena)\n" \
+                     f"⏱ <b>JAMI ISHLANGAN VAQT:</b> <b>{format_minutes(total_mins)}</b> ({round(total_mins/60, 1)} soat)\n\n"
+            if rows:
+                report += "Smenalar:\n"
+                for r in rows[:10]:
+                    report += f"• {r[0][5:16]} ➡️ {r[1][5:16] if r[1] else '---'} ({format_minutes(r[2])})\n"
+            bot.send_message(message.chat.id, report, parse_mode="HTML")
+
 # --- MINI APP BUYRUG'I (/app, /webapp) ---
 @bot.message_handler(commands=['app', 'webapp', 'portal'])
 def handle_app_command(message):
@@ -1346,6 +1453,7 @@ def handle_help(message):
     text += "☕️ <b>Tanaffusga chiqish</b> — Tanaffus vaqtini boshlaydi\n"
     text += "▶️ <b>Tanaffusdan qaytish</b> — Tanaffusni yakunlaydi\n"
     text += "⏱ <b>Mening soatlarim</b> — Oylik ishlangan soatlaringiz hisoboti\n"
+    text += "📅 <b>/oraliq 01.09.2026 15.10.2026</b> — Sanalar oralig'ida ishlangan vaqt hisoboti\n"
     text += "📅 <b>/bugun</b> — Bugungi smenalaringiz\n"
     text += "📱 <b>/app</b> — Veb Mini Appni ochish\n"
 
@@ -1368,3 +1476,4 @@ if __name__ == "__main__":
     # 6 soatlik fon monitoringini alohida potokda ishga tushirish
     threading.Thread(target=six_hour_scheduler_loop, daemon=True).start()
     bot.infinity_polling()
+
