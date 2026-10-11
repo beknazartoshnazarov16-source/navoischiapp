@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Navo Market: Hamma xodimlar va admin uchun umumiy jamoaviy bazaga ruxsat beriladi
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

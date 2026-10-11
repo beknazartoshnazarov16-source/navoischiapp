@@ -1,0 +1,10 @@
+{
+  "name": "navomarketishchibot",
+  "description": "Imported from GitHub: beknazartoshnazarov16-source/navoishchibot",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

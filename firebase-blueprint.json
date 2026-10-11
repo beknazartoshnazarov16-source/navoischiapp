@@ -1,0 +1,81 @@
+{
+  "entities": {
+    "users": {
+      "title": "users",
+      "description": "Do'kon ishchilari va adminlar ro'yxati",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "telegram_id": { "type": "string" },
+        "full_name": { "type": "string" },
+        "phone": { "type": "string" },
+        "role": { "type": "string" },
+        "position": { "type": "string" },
+        "work_start_time": { "type": "string" },
+        "work_end_time": { "type": "string" },
+        "is_active": { "type": "boolean" },
+        "salary_type": { "type": "string" },
+        "hourly_rate": { "type": "number" },
+        "fixed_salary": { "type": "number" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["id", "full_name", "phone", "role"]
+    },
+    "attendance": {
+      "title": "attendance",
+      "description": "Xodimlarning keldi-ketdi va davomat yozuvlari",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "user_id": { "type": "number" },
+        "date": { "type": "string" },
+        "check_in_time": { "type": "string" },
+        "check_out_date": { "type": "string" },
+        "check_out_time": { "type": "string" },
+        "check_in_lat": { "type": "number" },
+        "check_in_lon": { "type": "number" },
+        "total_break_minutes": { "type": "number" },
+        "worked_minutes": { "type": "number" },
+        "status": { "type": "string" },
+        "note": { "type": "string" },
+        "created_at": { "type": "string" }
+      },
+      "required": ["id", "user_id", "date", "status"]
+    },
+    "settings": {
+      "title": "settings",
+      "description": "Do'kon sozlamalari",
+      "type": "object",
+      "properties": {
+        "shop_name": { "type": "string" },
+        "gps_required": { "type": "boolean" },
+        "gps_checkout_required": { "type": "boolean" },
+        "market_latitude": { "type": "number" },
+        "market_longitude": { "type": "number" },
+        "gps_radius_meters": { "type": "number" },
+        "bot_token": { "type": "string" },
+        "admin_telegram_id": { "type": "string" },
+        "admin_pin": { "type": "string" },
+        "payroll_master_pin": { "type": "string" },
+        "payroll_admin_id": { "type": "string" },
+        "payroll_default_hourly_rate": { "type": "number" },
+        "payroll_payout_records": { "type": "array" },
+        "timezone": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "users",
+      "description": "Xodimlar hujjatlari"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": "attendance",
+      "description": "Davomat hujjatlari"
+    },
+    "/settings/{settingsDoc}": {
+      "schema": "settings",
+      "description": "Do'kon umumiy konfiguratsiyasi"
+    }
+  }
+}

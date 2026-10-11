@@ -1,0 +1,19 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+reports/
+test_reports/
+
+.vscode/
+.cursor/
+
+navo ishchilar boti/
+navo project miniapp/

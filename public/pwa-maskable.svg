@@ -1,0 +1,57 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- To'liq bo'yalgan fon -->
+  <rect width="512" height="512" fill="#00a651" />
+  <circle cx="256" cy="256" r="230" fill="#ffffff" />
+
+  <!-- Markaziy emblem 75% masshtabda -->
+  <g transform="translate(98, 90) scale(1.4)">
+    <defs>
+      <linearGradient id="mLeafGrad" x1="40" y1="20" x2="110" y2="85" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#76c843" />
+        <stop offset="100%" stopColor="#489d2c" />
+      </linearGradient>
+      <linearGradient id="mGreenArc" x1="90" y1="50" x2="185" y2="135" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#00b355" />
+        <stop offset="100%" stopColor="#008f45" />
+      </linearGradient>
+      <linearGradient id="mYellowArc" x1="30" y1="80" x2="95" y2="175" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#fdb813" />
+        <stop offset="100%" stopColor="#f59e0b" />
+      </linearGradient>
+      <linearGradient id="mRedArc" x1="55" y1="165" x2="175" y2="175" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#e52d27" />
+        <stop offset="100%" stopColor="#b31217" />
+      </linearGradient>
+      <linearGradient id="mCartGrad" x1="70" y1="90" x2="150" y2="150" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#ff6f1e" />
+        <stop offset="100%" stopColor="#e04e05" />
+      </linearGradient>
+    </defs>
+
+    <path
+      d="M38 42 C45 36, 68 56, 75 74 C82 52, 102 18, 126 8 C128 18, 114 42, 94 62 C85 71, 78 78, 72 78 C65 78, 54 62, 38 42 Z"
+      fill="url(#mLeafGrad)"
+    />
+    <path
+      d="M128 16 C165 42, 192 84, 192 132 C192 144, 189 156, 185 166 C176 154, 168 138, 160 120 C154 105, 142 85, 128 72 C134 52, 133 32, 128 16 Z"
+      fill="url(#mGreenArc)"
+    />
+    <path
+      d="M36 68 C24 88, 16 112, 16 138 C16 172, 30 202, 52 224 C56 208, 62 188, 72 170 C80 155, 92 138, 104 126 C88 108, 62 86, 36 68 Z"
+      fill="url(#mYellowArc)"
+    />
+    <path
+      d="M58 226 C82 242, 112 252, 144 250 C176 248, 204 234, 224 212 C206 214, 184 210, 162 200 C144 192, 126 178, 114 166 C94 188, 76 210, 58 226 Z"
+      fill="url(#mRedArc)"
+    />
+    <path
+      d="M74 88 L92 88 L104 140 L156 140 L166 98 L86 98"
+      stroke="url(#mCartGrad)"
+      stroke-width="9"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <circle cx="112" cy="154" r="7" fill="#ff6f1e" />
+    <circle cx="148" cy="154" r="7" fill="#ff6f1e" />
+  </g>
+</svg>

@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  html, body {
+    overflow-x: hidden;
+    width: 100%;
+    max-width: 100vw;
+    -webkit-text-size-adjust: 100%;
+    touch-action: manipulation;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  html.dark body {
+    background-color: #0b1120;
+    color: #f1f5f9;
+  }
+
+  #root {
+    overflow-x: hidden;
+    width: 100%;
+    min-height: 100vh;
+  }
+}
+
+/* Qorong'u rejim (Dark Mode) global xususiyatlari */
+html.dark .bg-white {
+  background-color: #0f172a;
+}
+html.dark .bg-slate-50 {
+  background-color: #0b1120;
+}
+html.dark .bg-slate-100 {
+  background-color: #1e293b;
+}
+html.dark .border-slate-200 {
+  border-color: #334155;
+}
+html.dark .border-slate-300 {
+  border-color: #475569;
+}
+html.dark .border-slate-100 {
+  border-color: #1e293b;
+}
+html.dark .text-slate-900 {
+  color: #f8fafc;
+}
+html.dark .text-slate-800 {
+  color: #f1f5f9;
+}
+html.dark .text-slate-700 {
+  color: #cbd5e1;
+}
+html.dark .text-slate-600 {
+  color: #94a3b8;
+}
+html.dark .text-slate-500 {
+  color: #94a3b8;
+}
+html.dark .text-slate-400 {
+  color: #64748b;
+}
+
+html.dark input:not([type="checkbox"]):not([type="radio"]),
+html.dark select,
+html.dark textarea {
+  background-color: #1e293b;
+  color: #f8fafc;
+  border-color: #334155;
+}
+
+html.dark input::placeholder,
+html.dark textarea::placeholder {
+  color: #64748b;
+}
+
+/* Kichik telefonlarda matnlar va jadvallar chiqib ketmasligi uchun */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@supports (padding: max(0px)) {
+  .pb-safe {
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), 12px);
+  }
+}
+
+
