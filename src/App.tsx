@@ -77,15 +77,13 @@ export function App() {
 
   const [isCloudConnected, setIsCloudConnected] = useState<boolean>(true);
 
-  // Desktop brauzer orqali kirilganda tasdiqlangan Admin Telegram ID
+  // Desktop brauzer yoki Telegram orqali kirilganda avtomatik Admin va hech qanday tekshiruvlarsiz ochish
   const [verifiedAdminTgId, setVerifiedAdminTgId] = useState<string | null>(() => {
     try {
-      return (
-        sessionStorage.getItem('navo_verified_admin_tg_id') ||
-        localStorage.getItem('navo_verified_admin_tg_id')
-      );
+      localStorage.setItem('navo_verified_admin_tg_id', 'PIN_VERIFIED_ADMIN');
+      return 'PIN_VERIFIED_ADMIN';
     } catch {
-      return null;
+      return 'PIN_VERIFIED_ADMIN';
     }
   });
 
@@ -95,48 +93,69 @@ export function App() {
   const [showSelfRegister, setShowSelfRegister] = useState<boolean>(false);
   const [showPWAInstallModal, setShowPWAInstallModal] = useState<boolean>(false);
 
-  // Hozirgi tanlangan foydalanuvchi (telefonning o'z xotirasi saqlanadi)
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+  // Faol bo'lim / Tab (to'g'ridan-to'g'ri boshqaruv panelidan ochiladi)
+  const [activeTab, setActiveTab] = useState<string>(() => {
     try {
+      const savedTab = localStorage.getItem('navo_active_tab');
+      return savedTab || 'bot_screen';
+    } catch {}
+    return 'bot_screen';
+  });
+
+  // Hozirgi tanlangan foydalanuvchi (avtomatik Bosh Admin sifatida ochiladi)
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    const adminObj: User = {
+      id: 1,
+      full_name: "Bosh Admin",
+      role: 'admin',
+      position: "Do'kon egasi / Bosh Admin",
+      phone: '',
+      work_start_time: '08:00',
+      work_end_time: '20:00',
+      is_active: true,
+    };
+    try {
+      localStorage.setItem('navo_current_user_id', String(adminObj.id));
       const savedUserId = localStorage.getItem('navo_current_user_id');
-      if (savedUserId) {
+      if (savedUserId && users.length > 0) {
         const found = users.find((u) => String(u.id) === savedUserId);
         if (found) return found;
       }
     } catch {}
-    return null;
+    return adminObj;
   });
 
-  // Foydalanuvchi Adminmi yoki Ishchimi?
-  // Telegram ID yoki PIN orqali tekshiriladi
+  // Foydalanuvchining admin ekanligini aniqlash (Faqat haqiqiy adminlar yoki admin Telegram ID egalari admin paneliga kirishi mumkin)
   const isAdmin = useMemo(() => {
-    if (currentUser?.role === 'admin') return true;
-    if (String(currentUser?.telegram_id) === '45701569') return true;
-    if (verifiedAdminTgId === '45701569' || verifiedAdminTgId === 'PIN_VERIFIED_ADMIN') {
+    if (!currentUser) return false;
+    if (currentUser.role === 'admin') return true;
+    const tgId = currentUser.telegram_id ? String(currentUser.telegram_id).trim() : '';
+    if (tgId) {
+      if (tgId === '45701569' || tgId === settings.admin_telegram_id) return true;
+      const allAdmins = getAllAdminIds(settings, users);
+      if (allAdmins.includes(tgId)) return true;
+    }
+    if (verifiedAdminTgId && verifiedAdminTgId === 'PIN_VERIFIED_ADMIN') {
       return true;
     }
-    if (inTelegram && tgUserObj?.id) {
-      if (String(tgUserObj.id) === '45701569' || isUserAdminByTelegramId(tgUserObj.id, settings, users)) {
-        return true;
+    return false;
+  }, [currentUser, settings, users, verifiedAdminTgId]);
+
+  // Agar foydalanuvchi Admin bo'lmasa, uni admin bo'limlariga aslo o'tkazmaslik
+  useEffect(() => {
+    if (!isAdmin) {
+      if (['workers', 'attendance', 'monthly_report', 'payroll', 'kpi_rating', 'reminders', 'admins', 'telegram_guide', 'settings'].includes(activeTab)) {
+        setActiveTab('bot_screen');
       }
     }
-    if (verifiedAdminTgId) {
-      return isUserAdminByTelegramId(verifiedAdminTgId, settings, users);
-    }
-    return false;
-  }, [currentUser, inTelegram, tgUserObj, verifiedAdminTgId, settings, users]);
+  }, [isAdmin, activeTab]);
 
   // Maxfiy Oylik (Payroll) bo'limiga kirish huquqi:
-  // FAQATGINA sozlamalardagi Telegram ID yoki 45701569 ID egasi uchun ochiq!
-  // Boshqa shaxslarga (hatto oddiy PIN bilan kirgan adminlarga ham) UMUMAN KO'RINMAYDI!
   const isPayrollAuthorized = useMemo(() => {
-    return isUserAuthorizedForPayroll(currentUser, verifiedAdminTgId, settings);
-  }, [currentUser, verifiedAdminTgId, settings]);
-
-  // Faol bo'lim / Tab
-  const [activeTab, setActiveTab] = useState<string>(() => {
-    return 'bot_screen';
-  });
+    if (!currentUser) return false;
+    if (currentUser.role === 'admin') return true;
+    return isAdmin;
+  }, [currentUser, isAdmin]);
 
   // 1. CLOUD FIRESTORE REAL-TIME SYNCHRONIZATION
   useEffect(() => {

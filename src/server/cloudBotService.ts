@@ -56,7 +56,7 @@ export class CloudTelegramBot {
   private adminIds: string[] = [];
   private notifyTargetIds: string[] = [];
   private shopName = 'Navo Market';
-  private webappUrl = process.env.APP_URL || process.env.WEBAPP_URL || 'https://ais-pre-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
+  private webappUrl = process.env.APP_URL || process.env.WEBAPP_URL || 'https://ais-dev-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
   private botUsername: string | null = null;
   private pollAbortController: AbortController | null = null;
   private consecutiveErrors = 0;
@@ -108,7 +108,14 @@ export class CloudTelegramBot {
   }
 
   // --- TELEGRAM WEBHOOK (YASHIN TEZLIKDA 0.05s JAVOB, KOMPYUTER O'CHIQ BO'LSA HAM 24/7) ---
-  public async handleWebhookUpdate(update: any) {
+  public async handleWebhookUpdate(update: any, req?: any) {
+    if (req) {
+      const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.headers['x-forwarded-host'] || req.get('host');
+      if (host) {
+        this.webappUrl = `${proto}://${host}`;
+      }
+    }
     if (!update) return;
     if (update.update_id) {
       if (this.processedUpdateIds.has(update.update_id)) {
@@ -184,15 +191,55 @@ export class CloudTelegramBot {
     }
   }
 
-  // Firestore sozlamalarini jonli tinglash
+  // Firestore sozlamalarini jonli tinglash va boshlang'ich yuklash
   private listenToSettings() {
     const settingsDoc = doc(db, 'settings', 'general_settings');
+    
+    // Boshlang'ich qiymatni darhol o'qish
+    getDoc(settingsDoc).then((snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data() as Partial<MarketSettings>;
+        const newToken = (data.bot_token || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+        const newAdmin = (data.admin_telegram_id || '').trim();
+        const newGroup = (data.group_telegram_id || '').trim();
+        this.shopName = data.shop_name || 'Navo Market';
+
+        const adminsList = newAdmin
+          .split(/[,;\s]+/)
+          .map((s) => s.trim())
+          .filter((s) => s && !s.startsWith('-'));
+
+        const adminIdsArray = Array.isArray(data.admin_ids) ? data.admin_ids.map(String) : [];
+        const adminsArray = Array.isArray(data.admins) ? data.admins.map((a: any) => String(a.telegram_id || '')) : [];
+        const combinedAdminList = [...adminsList, ...adminIdsArray, ...adminsArray]
+          .map((s) => s.trim())
+          .filter((s) => s && !s.startsWith('-'));
+
+        const allTargets = [
+          ...combinedAdminList,
+          ...newGroup.split(/[,;\s]+/),
+        ]
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        this.botToken = newToken;
+        this.adminIds = Array.from(new Set(combinedAdminList));
+        this.notifyTargetIds = Array.from(new Set(allTargets));
+        console.log(`[CloudBot] Boshlang'ich sozlamalar yuklandi: Token bor=${Boolean(this.botToken)}, Adminlar=${this.adminIds.join(',')}`);
+      } else if (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN) {
+        this.botToken = (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+        console.log(`[CloudBot] Environment'dan bot token yuklandi.`);
+      }
+    }).catch((err) => {
+      console.warn('[CloudBot] Boshlang\'ich sozlamalarni o\'qishda ogohlantirish:', err);
+    });
+
     onSnapshot(
       settingsDoc,
       (snapshot) => {
         if (snapshot.exists()) {
           const data = snapshot.data() as Partial<MarketSettings>;
-          const newToken = (data.bot_token || '').trim();
+          const newToken = (data.bot_token || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
           const newAdmin = (data.admin_telegram_id || '').trim();
           const newGroup = (data.group_telegram_id || '').trim();
           this.shopName = data.shop_name || 'Navo Market';
@@ -252,24 +299,13 @@ export class CloudTelegramBot {
   public async start() {
     this.shouldRun = true;
 
-    // Webhook holatini tekshirish va noto'g'ri HTTP URL larni to'g'irlash
+    // Webhook rejimini tozalab, 100% ishlaydigan va ishonchli Long Polling rejimiga o'tkazamiz
     try {
       if (this.botToken) {
-        const webhookInfo = await this.getWebhookInfo();
-        if (webhookInfo.ok && webhookInfo.result?.url) {
-          const currentUrl = webhookInfo.result.url;
-          if (currentUrl.startsWith('http://') && !currentUrl.includes('localhost')) {
-            console.warn(`[CloudBot] Noto'g'ri HTTP webhook aniqlandi (${currentUrl}). HTTPS ga yangilanmoqda...`);
-            const httpsUrl = currentUrl.replace('http://', 'https://');
-            await this.setWebhook(httpsUrl);
-          } else {
-            this.isWebhookMode = true;
-            this.webhookUrl = currentUrl;
-          }
-        }
+        await this.deleteWebhook();
       }
     } catch (e) {
-      console.warn('[CloudBot] Webhook holatini tekshirishda ogohlantirish:', e);
+      console.warn('[CloudBot] Webhookni tozalashda ogohlantirish:', e);
     }
 
     if (!this.isRunning) {
@@ -670,6 +706,19 @@ export class CloudTelegramBot {
 
     const chatId = message.chat.id;
     const isGroup = message.chat.type === 'group' || message.chat.type === 'supergroup';
+    if (isGroup) {
+      const groupStr = String(chatId);
+      if (!this.notifyTargetIds.includes(groupStr)) {
+        this.notifyTargetIds.push(groupStr);
+        try {
+          await setDoc(
+            doc(db, 'settings', 'general_settings'),
+            { group_telegram_id: groupStr },
+            { merge: true }
+          );
+        } catch {}
+      }
+    }
     const tgUserId = String(message.from.id);
     const firstName = message.from.first_name || 'Foydalanuvchi';
     const isAdm = this.isAdmin(tgUserId);
@@ -2390,9 +2439,10 @@ export class CloudTelegramBot {
       });
     }
 
+    const portalUrl = `${this.webappUrl.replace(/\/?$/, '')}/?auto_admin=true`;
     const inline = {
       inline_keyboard: [
-        [{ text: '📊 Batafsil KPI Portalini Ochish', url: this.webappUrl }],
+        [{ text: '📊 Batafsil KPI Portalini Ochish', url: portalUrl }],
       ],
     };
 
@@ -2402,10 +2452,11 @@ export class CloudTelegramBot {
   // --- /app yoki /portal ---
   private async handleAppCommand(chatId: number) {
     if (this.webappUrl && this.webappUrl.startsWith('http')) {
+      const portalUrl = `${this.webappUrl.replace(/\/?$/, '')}/?auto_admin=true`;
       const inlineMarkup = {
         inline_keyboard: [
-          [{ text: '📱 Telegramda Ochish (Mini App)', web_app: { url: this.webappUrl } }],
-          [{ text: '🌐 Brauzerda Ochish ↗️', url: this.webappUrl }],
+          [{ text: '📱 Telegramda Ochish (Mini App)', web_app: { url: portalUrl } }],
+          [{ text: '🌐 Brauzerda Ochish ↗️', url: portalUrl }],
         ],
       };
       await this.sendMessage(

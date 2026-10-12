@@ -99,7 +99,7 @@ async function startServer() {
     res.status(200).json({ ok: true });
     try {
       if (req.method === 'POST' && req.body && req.body.update_id !== undefined) {
-        await cloudTelegramBot.handleWebhookUpdate(req.body);
+        await cloudTelegramBot.handleWebhookUpdate(req.body, req);
       }
     } catch (err: any) {
       console.error('[Telegram Webhook Error]', err?.message || err);
