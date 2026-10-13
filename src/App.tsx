@@ -77,13 +77,13 @@ export function App() {
 
   const [isCloudConnected, setIsCloudConnected] = useState<boolean>(true);
 
-  // Desktop brauzer yoki Telegram orqali kirilganda avtomatik Admin va hech qanday tekshiruvlarsiz ochish
+  // Faqat haqiqiy adminlar yoki PIN kiritganlar admin huquqiga ega bo'lishi
   const [verifiedAdminTgId, setVerifiedAdminTgId] = useState<string | null>(() => {
     try {
-      localStorage.setItem('navo_verified_admin_tg_id', 'PIN_VERIFIED_ADMIN');
-      return 'PIN_VERIFIED_ADMIN';
+      const saved = localStorage.getItem('navo_verified_admin_tg_id');
+      return saved || null;
     } catch {
-      return 'PIN_VERIFIED_ADMIN';
+      return null;
     }
   });
 
@@ -102,44 +102,52 @@ export function App() {
     return 'bot_screen';
   });
 
-  // Hozirgi tanlangan foydalanuvchi (avtomatik Bosh Admin sifatida ochiladi)
+  // Hozirgi tanlangan foydalanuvchi (Xavfsiz: faqat tasdiqlangan sessiya yoki xodim)
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    const adminObj: User = {
-      id: 1,
-      full_name: "Bosh Admin",
-      role: 'admin',
-      position: "Do'kon egasi / Bosh Admin",
-      phone: '',
-      work_start_time: '08:00',
-      work_end_time: '20:00',
-      is_active: true,
-    };
     try {
-      localStorage.setItem('navo_current_user_id', String(adminObj.id));
       const savedUserId = localStorage.getItem('navo_current_user_id');
-      if (savedUserId && users.length > 0) {
-        const found = users.find((u) => String(u.id) === savedUserId);
+      const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
+      const savedUsers = loadState<User[]>('users', INITIAL_USERS);
+      
+      if (savedUserId && savedUserId !== '1') {
+        const found = savedUsers.find((u) => String(u.id) === savedUserId);
+        if (found) return found;
+      } else if (savedUserId === '1' && savedVerifiedAdmin) {
+        // Faqat haqiqiy tasdiqlangan admin bo'lsagina 1-ID qabul qilinadi
+        const found = savedUsers.find((u) => u.id === 1 && u.role === 'admin');
         if (found) return found;
       }
     } catch {}
-    return adminObj;
+    return null;
   });
 
-  // Foydalanuvchining admin ekanligini aniqlash (Faqat haqiqiy adminlar yoki admin Telegram ID egalari admin paneliga kirishi mumkin)
+  // Foydalanuvchining admin ekanligini aniqlash (Faqat haqiqiy adminlar yoki admin Telegram ID / PIN egalari admin paneliga kirishi mumkin)
   const isAdmin = useMemo(() => {
     if (!currentUser) return false;
-    if (currentUser.role === 'admin') return true;
-    const tgId = currentUser.telegram_id ? String(currentUser.telegram_id).trim() : '';
-    if (tgId) {
-      if (tgId === '45701569' || tgId === settings.admin_telegram_id) return true;
-      const allAdmins = getAllAdminIds(settings, users);
-      if (allAdmins.includes(tgId)) return true;
-    }
+    
+    // 1. PIN-kod orqali tasdiqlangan
     if (verifiedAdminTgId && verifiedAdminTgId === 'PIN_VERIFIED_ADMIN') {
       return true;
     }
+
+    // 2. Maxsus tasdiqlangan Telegram ID orqali
+    const checkTgId = verifiedAdminTgId || (currentUser.telegram_id ? String(currentUser.telegram_id).trim() : '');
+    if (checkTgId) {
+      if (checkTgId === '45701569' || checkTgId === settings.admin_telegram_id) return true;
+      const allAdmins = getAllAdminIds(settings, users);
+      if (allAdmins.includes(checkTgId)) return true;
+    }
+
+    // 3. Telegram WebApp ichida bo'lsa
+    if (tgUserObj) {
+      const tgIdStr = String(tgUserObj.id);
+      if (tgIdStr === '45701569' || tgIdStr === settings.admin_telegram_id) return true;
+      const allAdmins = getAllAdminIds(settings, users);
+      if (allAdmins.includes(tgIdStr)) return true;
+    }
+
     return false;
-  }, [currentUser, settings, users, verifiedAdminTgId]);
+  }, [currentUser, settings, users, verifiedAdminTgId, tgUserObj]);
 
   // Agar foydalanuvchi Admin bo'lmasa, uni admin bo'limlariga aslo o'tkazmaslik
   useEffect(() => {
@@ -167,10 +175,33 @@ export function App() {
           localStorage.setItem('navo_time_users', JSON.stringify(cloudUsers));
 
           setCurrentUser((prevCurr) => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const workerTgId = urlParams.get('worker_tg_id');
+            const autoAdmin = urlParams.get('auto_admin') === 'true';
+
+            // Agar ishchi havola orqali ochgan bo'lsa, uni darhol o'z profiliga bog'laymiz
+            if (workerTgId && !autoAdmin) {
+              const matchedWorker = cloudUsers.find(
+                (u) => String(u.telegram_id || '').trim() === String(workerTgId).trim()
+              );
+              if (matchedWorker) {
+                try {
+                  localStorage.setItem('navo_current_user_id', String(matchedWorker.id));
+                } catch {}
+                return matchedWorker;
+              }
+            }
+
             if (!prevCurr) {
               try {
                 const savedId = localStorage.getItem('navo_current_user_id');
+                const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
                 if (savedId) {
+                  if (savedId === '1' && !savedVerifiedAdmin) {
+                    // Ruxsatsiz Bosh Admin keshini tozalash
+                    localStorage.removeItem('navo_current_user_id');
+                    return null;
+                  }
                   const savedUser = cloudUsers.find((u) => String(u.id) === savedId);
                   if (savedUser) return savedUser;
                 }
@@ -218,6 +249,22 @@ export function App() {
 
   // 2. Telegram WebApp orqali avtomatik foydalanuvchini va rolni aniqlash
   useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const workerTgId = urlParams.get('worker_tg_id');
+    const autoAdmin = urlParams.get('auto_admin') === 'true';
+
+    if (workerTgId && !autoAdmin) {
+      const foundWorker = users.find((u) => String(u.telegram_id || '').trim() === String(workerTgId).trim());
+      if (foundWorker) {
+        setCurrentUser(foundWorker);
+        try {
+          localStorage.setItem('navo_current_user_id', String(foundWorker.id));
+        } catch {}
+        setActiveTab('bot_screen');
+        return;
+      }
+    }
+
     const isTg = isTelegramWebApp();
     setInTelegram(isTg);
 
@@ -314,12 +361,21 @@ export function App() {
       }
     } else if (!isTg) {
       // Telegram WebApp bo'lmagan oddiy brauzerda ochilganda
+      if (autoAdmin && !verifiedAdminTgId) {
+        setShowAdminLoginModal(true);
+      }
       try {
         const savedId = localStorage.getItem('navo_current_user_id');
+        const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
         if (savedId) {
-          const savedUser = users.find((u) => String(u.id) === savedId);
-          if (savedUser) {
-            setCurrentUser(savedUser);
+          if (savedId === '1' && !savedVerifiedAdmin) {
+            localStorage.removeItem('navo_current_user_id');
+            setCurrentUser(null);
+          } else {
+            const savedUser = users.find((u) => String(u.id) === savedId);
+            if (savedUser) {
+              setCurrentUser(savedUser);
+            }
           }
         }
       } catch {}

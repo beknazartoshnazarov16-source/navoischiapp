@@ -17,6 +17,11 @@ async function startServer() {
 
   app.use(express.json());
 
+  app.use((req: Request, res: Response, next) => {
+    cloudTelegramBot.updateBaseUrl(req);
+    next();
+  });
+
   // 1. Health-check endpoint
   app.get(['/api/health', '/healthz'], (req: Request, res: Response) => {
     res.json({

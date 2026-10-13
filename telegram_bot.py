@@ -42,7 +42,7 @@ ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else "123456789"
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID") or os.getenv("GROUP_TELEGRAM_ID") or ""
 SHOP_NAME = os.getenv("SHOP_NAME", "Navo Market")
 DB_PATH = os.getenv("DB_PATH", "market_time.db")
-WEBAPP_URL = os.getenv("WEBAPP_URL") or os.getenv("MINI_APP_URL") or "https://ais-pre-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app"
+WEBAPP_URL = os.getenv("WEBAPP_URL") or os.getenv("MINI_APP_URL") or "https://ais-pre-sn5pew5d4v6dsgb6ijaf5d-752669647478.asia-southeast1.run.app"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 

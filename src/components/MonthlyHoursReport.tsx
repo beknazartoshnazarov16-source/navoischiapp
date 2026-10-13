@@ -354,6 +354,17 @@ export function MonthlyHoursReport({
             <button
               type="button"
               onClick={() => {
+                const y = new Date().getFullYear();
+                setRangeStartDate(`${y}-08-15`);
+                setRangeEndDate(`${y}-09-18`);
+              }}
+              className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold border border-emerald-700 text-[11px] transition cursor-pointer shadow-xs"
+            >
+              15.08 — 18.09 (Maxsus oraliq)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 const now = new Date();
                 const past = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
                 setRangeStartDate(getLocalDateString(past));

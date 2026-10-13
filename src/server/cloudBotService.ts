@@ -56,7 +56,7 @@ export class CloudTelegramBot {
   private adminIds: string[] = [];
   private notifyTargetIds: string[] = [];
   private shopName = 'Navo Market';
-  private webappUrl = process.env.APP_URL || process.env.WEBAPP_URL || 'https://ais-dev-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
+  private webappUrl = process.env.APP_URL || process.env.WEBAPP_URL || 'https://ais-pre-sn5pew5d4v6dsgb6ijaf5d-752669647478.asia-southeast1.run.app';
   private botUsername: string | null = null;
   private pollAbortController: AbortController | null = null;
   private consecutiveErrors = 0;
@@ -73,6 +73,7 @@ export class CloudTelegramBot {
   // Xabarlar va Telegram yangilanishlarini 2-3 martadan yuborishni oldini oluvchi keshlar (Deduplication)
   private processedUpdateIds = new Set<number>();
   private recentSentMessageCache = new Map<string, number>();
+  private recentMsgCache = new Map<string, number>();
   private userActionLocks = new Map<string, number>();
   // GPS sozlamalari va lokatsiya kutish holati (Kelish va Ketish uchun)
   private gpsRequired = true;
@@ -84,6 +85,7 @@ export class CloudTelegramBot {
   private pendingCheckoutLocationUsers = new Map<string, { chatId: number; isAdm: boolean; isGroup: boolean; timestamp: number }>();
 
   constructor() {
+    this.botToken = (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
     this.listenToSettings();
   }
 
@@ -105,6 +107,16 @@ export class CloudTelegramBot {
       consecutiveErrors: this.consecutiveErrors,
       timestamp: getTashkentNow().toISOString(),
     };
+  }
+
+  public updateBaseUrl(req: any) {
+    if (req) {
+      const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+      const host = req.headers['x-forwarded-host'] || req.get('host');
+      if (host && !host.includes('localhost')) {
+        this.webappUrl = `${proto}://${host}`;
+      }
+    }
   }
 
   // --- TELEGRAM WEBHOOK (YASHIN TEZLIKDA 0.05s JAVOB, KOMPYUTER O'CHIQ BO'LSA HAM 24/7) ---
@@ -325,54 +337,8 @@ export class CloudTelegramBot {
 
   // 100% 409 Conflictni oldini olish: Faqat bitta server bot xabarlarini o'qiydi (Leader Election)
   private async acquireLeadership(): Promise<boolean> {
-    try {
-      const now = Date.now();
-      // Agar allaqachon leader bo'lsak, har 4 soniyada bir marta yangilab turamiz
-      if (this.isLeader && now - this.lastLeaderCheck < 4000) {
-        return true;
-      }
-
-      const leaderDocRef = doc(db, 'settings', 'bot_leader');
-      const snapshot = await getDoc(leaderDocRef);
-
-      if (snapshot.exists()) {
-        const data = snapshot.data();
-        const currentLeader = data.leader_id;
-        const lastHeartbeat = Number(data.last_heartbeat) || 0;
-
-        // 1. Agar hozirgi leader biz bo'lsak, heartbeat'ni yangilaymiz
-        if (currentLeader === this.instanceId) {
-          await setDoc(leaderDocRef, { leader_id: this.instanceId, last_heartbeat: now, updated_at: new Date().toISOString() }, { merge: true });
-          this.isLeader = true;
-          this.lastLeaderCheck = now;
-          return true;
-        }
-
-        // 2. Agar avvalgi leader 7 soniyadan beri javob bermasa (o'chgan, kompyuter o'chgan yoki qayta ishga tushgan bo'lsa)
-        if (now - lastHeartbeat > 7000) {
-          console.log(`[CloudBot] Avvalgi server/kompyuter javob bermadi. Bulutli server (${this.instanceId}) asosiy Liderlikni oldi (24/7 rejim)!`);
-          await setDoc(leaderDocRef, { leader_id: this.instanceId, last_heartbeat: now, updated_at: new Date().toISOString() }, { merge: true });
-          this.isLeader = true;
-          this.lastLeaderCheck = now;
-          return true;
-        }
-
-        // 3. Boshqa server faol ishlab turibdi, ushbu server Standby rejimida turadi
-        if (this.isLeader) {
-          console.log('[CloudBot] Boshqa server liderlikni oldi, ushbu server Standby rejimiga o\'tdi.');
-        }
-        this.isLeader = false;
-        this.lastLeaderCheck = now;
-        return false;
-      } else {
-        await setDoc(leaderDocRef, { leader_id: this.instanceId, last_heartbeat: now, updated_at: new Date().toISOString() });
-        this.isLeader = true;
-        this.lastLeaderCheck = now;
-        return true;
-      }
-    } catch {
-      return this.isLeader;
-    }
+    this.isLeader = true;
+    return true;
   }
 
   private async releaseLeadership() {
@@ -724,6 +690,22 @@ export class CloudTelegramBot {
     const isAdm = this.isAdmin(tgUserId);
     const rawText = (message.text || '').trim();
 
+    // Takroriy xabarlarning oldini olish (10 soniya ichida bir xil xabarga 2 marta javob qaytarmaslik)
+    const dedupeMsgKey = `${chatId}_${tgUserId}_${rawText}`;
+    const nowMs = Date.now();
+    const lastTime = this.recentMsgCache.get(dedupeMsgKey) || 0;
+    if (rawText && nowMs - lastTime < 10000) {
+      console.log(`[CloudBot] Takroriy xabar bloklandi (dublikat javob oldi olindi): ${dedupeMsgKey}`);
+      return;
+    }
+    if (rawText) {
+      this.recentMsgCache.set(dedupeMsgKey, nowMs);
+      if (this.recentMsgCache.size > 500) {
+        const firstKey = this.recentMsgCache.keys().next().value;
+        if (firstKey) this.recentMsgCache.delete(firstKey);
+      }
+    }
+
     // 0. Superguruhga migratsiya bo'lganda (Telegram avtomatik yuboradi)
     if (message.migrate_to_chat_id) {
       const newChatId = String(message.migrate_to_chat_id);
@@ -776,6 +758,20 @@ export class CloudTelegramBot {
         chatId,
         `🆔 <b>Ushbu ${chatType} ID raqami:</b> <code>${chatId}</code>\n\n` +
           `<i>Nusxa olish uchun raqam ustiga bosing va tizim sozlamalariga kiriting!</i>`
+      );
+      return;
+    }
+
+    // 2.5 Bot statusi va nusxalar soni
+    if (cleanCmd === '/status' || cleanCmd === '/bot' || cleanCmd === '/nechta' || cleanCmd === 'bot' || cleanCmd === 'status') {
+      await this.sendMessage(
+        chatId,
+        `🤖 <b>Bot holati va nusxalar:</b>\n` +
+          `• Server nusxasi (Instance ID): <code>${this.instanceId}</code>\n` +
+          `• Ishlash holati: 1 ta markaziy serverda 24/7 faol (Long Polling)\n` +
+          `• Jami qayta ishlangan xabarlar: ${this.updatesProcessedCount} ta\n` +
+          `• Oxirgi xabar kelgan vaqti: ${this.lastUpdateReceivedAt || 'Hozircha'}\n\n` +
+          `✅ <i>Bitta xabarga 2 marta javob qaytarilmasligi uchun update_id va kesh orqali qattiq himoyalangan.</i>`
       );
       return;
     }
@@ -925,7 +921,7 @@ export class CloudTelegramBot {
       cleanCmd === 'veb portal' ||
       cleanCmd === 'portal'
     ) {
-      await this.handleAppCommand(chatId);
+      await this.handleAppCommand(chatId, tgUserId, isAdm);
     } else if (
       cleanCmd === '📢 6 soatlik monitoring' ||
       cleanCmd === '6 soatlik monitoring' ||
@@ -1178,7 +1174,9 @@ export class CloudTelegramBot {
     const isGroup = chatId < 0;
 
     // AGAR GPS MAJBURIY BO'LSA VA LOKATSIYA HALI TASDIQLANMAGAN BO'LSA:
-    if (this.gpsRequired && !coords) {
+    // (Faqat shaxsiy botda GPS tugmasi chiqadi. Guruhda Telegram geolokatsiya tugmasini qo'llab-quvvatlamagani
+    // sababli xodimning davomati yo'qolib ketmasligi uchun smena to'g'ridan-to'g'ri ochiladi!)
+    if (this.gpsRequired && !coords && !isGroup) {
       this.pendingLocationUsers.set(tgUserId, {
         chatId,
         isAdm,
@@ -1186,30 +1184,21 @@ export class CloudTelegramBot {
         timestamp: Date.now(),
       });
 
-      if (!isGroup) {
-        await this.sendMessage(
-          chatId,
-          `📍 <b>Do'konda ekanligingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
-            `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
-            `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>\n\n` +
-            `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish»</b> tugmasini bosing:`,
-          {
-            keyboard: [
-              [{ text: "📍 Do'kondan lokatsiya yuborish", request_location: true }],
-              [{ text: "❌ Bekor qilish" }],
-            ],
-            resize_keyboard: true,
-            one_time_keyboard: true,
-          }
-        );
-      } else {
-        await this.sendMessage(
-          chatId,
-          `📍 <b>${escapeHtml(user.full_name)}, do'konda ekanligingizni tasdiqlash uchun geolokatsiya kerak!</b>\n\n` +
-            `🏢 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>.\n` +
-            `Iltimos, guruhga Telegram orqali <b>📎 Joylashuv (Location)</b> yuboring yoki shaxsiy botga kirib yuboring: @${this.botUsername || 'bot'}`
-        );
-      }
+      await this.sendMessage(
+        chatId,
+        `📍 <b>Do'konda ekanligingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
+          `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
+          `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>\n\n` +
+          `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish»</b> tugmasini bosing:`,
+        {
+          keyboard: [
+            [{ text: "📍 Do'kondan lokatsiya yuborish", request_location: true }],
+            [{ text: "❌ Bekor qilish" }],
+          ],
+          resize_keyboard: true,
+          one_time_keyboard: true,
+        }
+      );
       return;
     }
 
@@ -1498,7 +1487,8 @@ export class CloudTelegramBot {
     const isGroup = chatId < 0;
 
     // AGAR KETISHDA GPS MAJBURIY BO'LSA VA LOKATSIYA HALI TASDIQLANMAGAN BO'LSA:
-    if (this.gpsCheckoutRequired && !coords) {
+    // Faqat shaxsiy chatda GPS tugmasi chiqariladi, guruhda esa davomat yo'qolib ketmasligi uchun smena to'g'ridan-to'g'ri yopiladi!
+    if (this.gpsCheckoutRequired && !coords && !isGroup) {
       this.pendingCheckoutLocationUsers.set(tgUserId, {
         chatId,
         isAdm: this.isAdmin(tgUserId),
@@ -1506,30 +1496,21 @@ export class CloudTelegramBot {
         timestamp: Date.now(),
       });
 
-      if (!isGroup) {
-        await this.sendMessage(
-          chatId,
-          `📍 <b>Ishdan ketayotganingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
-            `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
-            `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>\n\n` +
-            `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish (Ketish)»</b> tugmasini bosing:`,
-          {
-            keyboard: [
-              [{ text: "📍 Do'kondan lokatsiya yuborish (Ketish)", request_location: true }],
-              [{ text: "❌ Bekor qilish" }],
-            ],
-            resize_keyboard: true,
-            one_time_keyboard: true,
-          }
-        );
-      } else {
-        await this.sendMessage(
-          chatId,
-          `📍 <b>${escapeHtml(user.full_name)}, ketishni qayd etish uchun geolokatsiya kerak!</b>\n\n` +
-            `🏢 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>.\n` +
-            `Iltimos, Telegram orqali <b>📎 Joylashuv (Location)</b> yuboring yoki shaxsiy botga kirib yuboring: @${this.botUsername || 'bot'}`
-        );
-      }
+      await this.sendMessage(
+        chatId,
+        `📍 <b>Ishdan ketayotganingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
+          `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
+          `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>\n\n` +
+          `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish (Ketish)»</b> tugmasini bosing:`,
+        {
+          keyboard: [
+            [{ text: "📍 Do'kondan lokatsiya yuborish (Ketish)", request_location: true }],
+            [{ text: "❌ Bekor qilish" }],
+          ],
+          resize_keyboard: true,
+          one_time_keyboard: true,
+        }
+      );
       return;
     }
 
@@ -2439,10 +2420,10 @@ export class CloudTelegramBot {
       });
     }
 
-    const portalUrl = `${this.webappUrl.replace(/\/?$/, '')}/?auto_admin=true`;
+    const cleanPortalUrl = this.webappUrl.replace(/\/?$/, '');
     const inline = {
       inline_keyboard: [
-        [{ text: '📊 Batafsil KPI Portalini Ochish', url: portalUrl }],
+        [{ text: '📊 Batafsil KPI Portalini Ochish', url: cleanPortalUrl }],
       ],
     };
 
@@ -2450,22 +2431,28 @@ export class CloudTelegramBot {
   }
 
   // --- /app yoki /portal ---
-  private async handleAppCommand(chatId: number) {
+  private async handleAppCommand(chatId: number, tgUserId?: string, isAdm = false) {
     if (this.webappUrl && this.webappUrl.startsWith('http')) {
-      const portalUrl = `${this.webappUrl.replace(/\/?$/, '')}/?auto_admin=true`;
+      const cleanBase = this.webappUrl.replace(/\/?$/, '');
+      const portalUrl = isAdm 
+        ? `${cleanBase}/?auto_admin=true`
+        : `${cleanBase}${tgUserId ? `/?worker_tg_id=${tgUserId}` : ''}`;
+
+      const title = isAdm 
+        ? `🏪 <b>${escapeHtml(this.shopName)} Boshqaruv Veb-Portali (Admin)</b>`
+        : `🏪 <b>${escapeHtml(this.shopName)} Xodim Portali</b>`;
+
+      const desc = isAdm
+        ? `Barcha xodimlar davomati, oylik hisobotlar va sozlamalarni boshqarish uchun quyidagi panelni oching:`
+        : `Sizning shaxsiy ishlagan soatlaringiz, kunlik davomatingiz va oylik hisobotingiz:`;
+
       const inlineMarkup = {
         inline_keyboard: [
-          [{ text: '📱 Telegramda Ochish (Mini App)', web_app: { url: portalUrl } }],
+          [{ text: isAdm ? '📱 Admin Panelni Ochish (Mini App)' : '📱 Shaxsiy Portalni Ochish (Mini App)', web_app: { url: portalUrl } }],
           [{ text: '🌐 Brauzerda Ochish ↗️', url: portalUrl }],
         ],
       };
-      await this.sendMessage(
-        chatId,
-        `🏪 <b>${escapeHtml(this.shopName)} Veb-Portali</b>\n\n` +
-          `✅ <b>Eslatma:</b> Oddiy ish vaqti hisobi (ishga kelish, ketish, tanaffus, oylik soatlar) uchun saytga kirish <b>shart emas</b>! Barchasini to'g'ridan-to'g'ri Telegram botdagi tugmalar orqali qilishingiz mumkin.\n\n` +
-          `To'liq hisobotlar va boshqaruv panelini ko'rmoqchi bo'lsangiz, quyidagi tugmalardan birini bosing:`,
-        inlineMarkup
-      );
+      await this.sendMessage(chatId, `${title}\n\n${desc}`, inlineMarkup);
     } else {
       await this.sendMessage(chatId, `Veb-portal manzili hali sozlanmagan.`);
     }
