@@ -36,7 +36,7 @@ export function PWAInstallModal({ isOpen, onClose }: PWAInstallModalProps) {
   const rawOrigin = typeof window !== 'undefined' ? window.location.origin : '';
   const publicAppUrl =
     rawOrigin.replace('ais-dev-', 'ais-pre-') ||
-    'https://ais-pre-sn5pew5d4v6dsgb6ijaf5d-752669647478.asia-southeast1.run.app';
+    'https://ais-pre-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
 
   const handleInstallClick = async () => {
     triggerHaptic('light');

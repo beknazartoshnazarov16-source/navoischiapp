@@ -34,6 +34,8 @@ import {
   Megaphone,
   Crown,
   Navigation,
+  Bot,
+  ExternalLink,
 } from 'lucide-react';
 import { triggerHaptic, getTelegramUser, isTelegramWebApp } from '../utils/telegram';
 
@@ -525,6 +527,32 @@ export function WorkerPortal({
             <span>·</span>
             <span className="text-emerald-700 font-bold bg-emerald-50 px-1.5 py-0.5 rounded text-[10px]">08:00 — 23:00</span>
           </div>
+        </div>
+
+        {/* 🤖 24/7 Telegram Boti Jonli Integratsiya Kartasi */}
+        <div className="mt-3 mb-2 p-3 bg-gradient-to-r from-sky-50 via-teal-50 to-emerald-50 rounded-2xl border border-sky-200/80 max-w-sm mx-auto shadow-2xs flex items-center justify-between gap-2.5 text-left">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-sky-600 to-teal-500 text-white flex items-center justify-center shrink-0 shadow-xs">
+              <Bot className="w-5 h-5 text-white" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-xs font-black text-slate-900">Telegram Davomat Boti</span>
+                <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+                  24/7 Faol
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-500 truncate mt-0.5">
+                Guruhda va shaxsiy botda keldi-ketdi doimiy yoziladi
+              </p>
+            </div>
+          </div>
+          {settings.bot_token && (
+            <span className="text-[10px] font-bold px-2 py-1 bg-white border border-sky-200 text-sky-700 rounded-lg shrink-0 shadow-2xs">
+              Ulangan ✓
+            </span>
+          )}
         </div>
 
         {/* 0. Do'kon rahbariyati E'loni / Eslatmasi */}

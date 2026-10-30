@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { MarketSettings, User, Attendance } from '../types';
 import {
   Settings,
@@ -59,10 +59,37 @@ export function SettingsManager({
   const [tgTestResult, setTgTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedAppUrl, setCopiedAppUrl] = useState(false);
   const [isSettingWebhook, setIsSettingWebhook] = useState(false);
-  const [webhookStatus, setWebhookStatus] = useState<{ url?: string; ok?: boolean; error?: string } | null>(null);
+  const [webhookStatus, setWebhookStatus] = useState<{ botUsername?: string; ok?: boolean; error?: string } | null>(null);
+  const [connectedBotUsername, setConnectedBotUsername] = useState<string | null>(null);
+  const [isBotOnline, setIsBotOnline] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const currentAppUrl = typeof window !== 'undefined' ? window.location.origin : '';
+  const publicAppUrl =
+    (currentAppUrl ? currentAppUrl.replace('ais-dev-', 'ais-pre-') : '') ||
+    'https://ais-pre-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
+
+  useEffect(() => {
+    let active = true;
+    const checkStatus = async () => {
+      try {
+        const res = await fetch('/api/telegram/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!active) return;
+        setConnectedBotUsername(data.botUsername || null);
+        setIsBotOnline(Boolean(data.running && data.hasToken));
+      } catch {
+        // Tarmoq uzilishida jim o'tkazamiz
+      }
+    };
+    checkStatus();
+    const timer = setInterval(checkStatus, 8000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, []);
 
   const handleSetupWebhook = async () => {
     if (!formData.bot_token) {
@@ -72,17 +99,20 @@ export function SettingsManager({
     setIsSettingWebhook(true);
     setWebhookStatus(null);
     try {
-      const res = await fetch('/api/telegram/webhook/set', {
+      onSaveSettings(formData);
+      const res = await fetch('/api/telegram/reconnect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: window.location.origin }),
+        body: JSON.stringify({ token: formData.bot_token.trim() }),
       });
       const data = await res.json();
       if (data.ok) {
-        setWebhookStatus({ ok: true, url: window.location.origin });
+        if (data.botUsername) setConnectedBotUsername(data.botUsername);
+        setIsBotOnline(true);
+        setWebhookStatus({ ok: true, botUsername: data.botUsername });
         triggerHaptic('success');
       } else {
-        setWebhookStatus({ ok: false, error: data.description || data.error || "Vebxukni o'rnatib bo'lmadi" });
+        setWebhookStatus({ ok: false, error: data.description || data.error || "Botga ulanib bo'lmadi" });
         triggerHaptic('error');
       }
     } catch (e: any) {
@@ -465,8 +495,7 @@ export function SettingsManager({
           <button
             type="button"
             onClick={() => {
-              const publicUrl = currentAppUrl.replace('ais-dev-', 'ais-pre-') || currentAppUrl;
-              navigator.clipboard.writeText(publicUrl);
+              navigator.clipboard.writeText(publicAppUrl);
               setCopiedAppUrl(true);
               setTimeout(() => setCopiedAppUrl(false), 2000);
             }}
@@ -736,7 +765,7 @@ export function SettingsManager({
             </div>
           )}
 
-          {/* ⚡️ 24/7 BULUTLI REJIM VA TEZKOR VEBXUK (KOMPYUTER O'CHIQ BO'LSA HAM 0.05s TEZLIK) */}
+          {/* ⚡️ 24/7 BULUTLI REJIM VA BOT ULANISHI */}
           <div className="p-4 bg-gradient-to-r from-emerald-50 via-teal-50 to-emerald-50 rounded-2xl border border-emerald-300 shadow-2xs space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
@@ -744,14 +773,31 @@ export function SettingsManager({
                   <Zap className="w-5 h-5 text-amber-300" />
                 </div>
                 <div>
-                  <div className="text-xs sm:text-sm font-black text-emerald-950 flex items-center gap-2">
-                    <span>⚡️ 24/7 Avtonom Bulutli Rejim (Webhook)</span>
-                    <span className="px-2 py-0.5 rounded-full bg-emerald-200 text-emerald-900 text-[10px] font-black">
-                      0.05s tezlik
+                  <div className="text-xs sm:text-sm font-black text-emerald-950 flex items-center gap-2 flex-wrap">
+                    <span>⚡️ 24/7 Avtonom Bulutli Bot</span>
+                    {connectedBotUsername ? (
+                      <a
+                        href={`https://t.me/${connectedBotUsername}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-2 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-black inline-flex items-center gap-1 hover:bg-emerald-700 transition"
+                      >
+                        <span>@{connectedBotUsername}</span>
+                        <ExternalLink className="w-2.5 h-2.5" />
+                      </a>
+                    ) : null}
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-black ${
+                        isBotOnline
+                          ? 'bg-emerald-200 text-emerald-900'
+                          : 'bg-amber-200 text-amber-900'
+                      }`}
+                    >
+                      {isBotOnline ? 'Faol (24/7)' : 'Tekshirilmoqda'}
                     </span>
                   </div>
                   <p className="text-[11px] text-emerald-800 mt-0.5">
-                    Kompyuteringiz butunlay o'chiq bo'lsa ham bot 24/7 to'xtovsiz va 0.05 soniyada yashindek tez ishlaydi!
+                    Kompyuteringiz butunlay o'chiq bo'lsa ham bot Google Cloud serverida 24/7 to'xtovsiz va dublikatsiz ishlaydi!
                   </p>
                 </div>
               </div>
@@ -763,7 +809,7 @@ export function SettingsManager({
                 className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-1.5 shadow-xs cursor-pointer active:scale-95 shrink-0"
               >
                 <Zap className="w-3.5 h-3.5 text-amber-300" />
-                <span>{isSettingWebhook ? "Ulanmoqda..." : "⚡️ 24/7 Bulutli Rejimni Yoqish"}</span>
+                <span>{isSettingWebhook ? "Tekshirilmoqda..." : "⚡️ 24/7 Botni Qayta Ulash & Tekshirish"}</span>
               </button>
             </div>
 
@@ -779,7 +825,7 @@ export function SettingsManager({
                   <>
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                     <span>
-                      ✅ <b>Muvaffaqiyatli ulandi!</b> Endi bot to'g'ridan-to'g'ri Google Cloud serverida ishlaydi. Kompyuteringizni xohlagan payt o'chirishingiz mumkin, bot 24/7 o'chmaydi va 0.05 soniyada yashindek tez javob qaytaradi!
+                      ✅ <b>Muvaffaqiyatli ulandi{webhookStatus.botUsername ? ` (@${webhookStatus.botUsername})` : ''}!</b> Eski xato vebxuklar tozalandi va yagona 24/7 Google Cloud ulanishi faollashtirildi. Bot bitta xabarga faqat 1 marta aniq javob qaytaradi!
                     </span>
                   </>
                 ) : (
@@ -880,16 +926,16 @@ export function SettingsManager({
           <div className="p-3 bg-white rounded-xl border border-sky-100 flex items-center justify-between gap-2 flex-wrap">
             <div className="min-w-0 flex-1">
               <span className="text-[10px] uppercase font-bold text-slate-400 block tracking-wider">
-                Telegram Mini App Havolasi (Menu Button):
+                Telegram Mini App Ommaviy Havolasi (Menu Button):
               </span>
               <span className="text-xs font-mono font-semibold text-slate-800 truncate block">
-                {currentAppUrl}
+                {publicAppUrl}
               </span>
             </div>
             <button
               type="button"
               onClick={() => {
-                navigator.clipboard.writeText(currentAppUrl);
+                navigator.clipboard.writeText(publicAppUrl);
                 setCopiedAppUrl(true);
                 setTimeout(() => setCopiedAppUrl(false), 2000);
               }}

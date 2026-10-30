@@ -77,10 +77,18 @@ export function App() {
 
   const [isCloudConnected, setIsCloudConnected] = useState<boolean>(true);
 
-  // Faqat haqiqiy adminlar yoki PIN kiritganlar admin huquqiga ega bo'lishi
+  // Maxfiy kalit nomi yangilandi (avvalgi xato tufayli boshqa qurilmalarda qolib ketgan eski admin keshlarini 100% tozalash uchun)
+  const ADMIN_AUTH_STORAGE_KEY = 'navo_verified_admin_v2';
+
+  // Faqat haqiqiy PIN kiritgan yoki Telegram WebApp orqali tasdiqlangan adminlargina huquq oladi
   const [verifiedAdminTgId, setVerifiedAdminTgId] = useState<string | null>(() => {
     try {
-      const saved = localStorage.getItem('navo_verified_admin_tg_id');
+      // Eski versiyadagi keshni xavfsizlik uchun tozalaymiz
+      localStorage.removeItem('navo_verified_admin_tg_id');
+      sessionStorage.removeItem('navo_verified_admin_tg_id');
+      const saved =
+        sessionStorage.getItem(ADMIN_AUTH_STORAGE_KEY) ||
+        localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
       return saved || null;
     } catch {
       return null;
@@ -93,7 +101,7 @@ export function App() {
   const [showSelfRegister, setShowSelfRegister] = useState<boolean>(false);
   const [showPWAInstallModal, setShowPWAInstallModal] = useState<boolean>(false);
 
-  // Faol bo'lim / Tab (to'g'ridan-to'g'ri boshqaruv panelidan ochiladi)
+  // Faol bo'lim / Tab
   const [activeTab, setActiveTab] = useState<string>(() => {
     try {
       const savedTab = localStorage.getItem('navo_active_tab');
@@ -102,68 +110,107 @@ export function App() {
     return 'bot_screen';
   });
 
-  // Hozirgi tanlangan foydalanuvchi (Xavfsiz: faqat tasdiqlangan sessiya yoki xodim)
+  // Hozirgi tanlangan foydalanuvchi:
+  // QAT'IY XAVFSIZLIK: Tizimga kirmagan yangi foydalanuvchi uchun DOIMO `null` (Kirish ekrani) ochiladi!
+  // Hech qachon avtomatik ravishda Admin yoki begona ishchi profili ochib berilmaydi!
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     try {
       const savedUserId = localStorage.getItem('navo_current_user_id');
-      const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
+      const savedVerifiedAdmin =
+        sessionStorage.getItem(ADMIN_AUTH_STORAGE_KEY) ||
+        localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
+      const savedSettings = loadState<MarketSettings>('settings', INITIAL_SETTINGS);
       const savedUsers = loadState<User[]>('users', INITIAL_USERS);
-      
-      if (savedUserId && savedUserId !== '1') {
-        const found = savedUsers.find((u) => String(u.id) === savedUserId);
-        if (found) return found;
-      } else if (savedUserId === '1' && savedVerifiedAdmin) {
-        // Faqat haqiqiy tasdiqlangan admin bo'lsagina 1-ID qabul qilinadi
-        const found = savedUsers.find((u) => u.id === 1 && u.role === 'admin');
-        if (found) return found;
+
+      if (!savedUserId) {
+        return null;
       }
-    } catch {}
-    return null;
+
+      const found = savedUsers.find((u) => String(u.id) === savedUserId);
+      if (!found) {
+        return null;
+      }
+
+      const isFoundAdminAccount =
+        found.id === 1 ||
+        found.role === 'admin' ||
+        isUserAdminByTelegramId(found.telegram_id, savedSettings, savedUsers);
+
+      if (isFoundAdminAccount) {
+        if (!savedVerifiedAdmin) {
+          localStorage.removeItem('navo_current_user_id');
+          return null;
+        }
+        return found;
+      }
+
+      return found;
+    } catch {
+      return null;
+    }
   });
 
-  // Foydalanuvchining admin ekanligini aniqlash (Faqat haqiqiy adminlar yoki admin Telegram ID / PIN egalari admin paneliga kirishi mumkin)
+  // Foydalanuvchining admin ekanligini QAT'IY tekshirish:
+  // Faqat (1) Telegram Mini App ichida haqiqiy admin Telegram akkaunti bilan kirganda
+  // yoki (2) Maxfiy Admin PIN-kod bilan tasdiqlangandagina `true` bo'ladi!
+  // `currentUser.telegram_id` yoki URL parametridan kelgan ID o'z-o'zidan HECH QACHON admin huquqini bermaydi!
   const isAdmin = useMemo(() => {
     if (!currentUser) return false;
-    
-    // 1. PIN-kod orqali tasdiqlangan
-    if (verifiedAdminTgId && verifiedAdminTgId === 'PIN_VERIFIED_ADMIN') {
+
+    // 1. Agar Telegram Mini App ichida haqiqiy Telegram foydalanuvchisi aniqlangan bo'lsa:
+    if (inTelegram && tgUserObj?.id) {
+      const liveTgId = String(tgUserObj.id).trim();
+      if (isUserAdminByTelegramId(liveTgId, settings, users)) {
+        return true;
+      }
+      if (
+        verifiedAdminTgId === 'PIN_VERIFIED_ADMIN' ||
+        verifiedAdminTgId === 'PAYROLL_PIN_VERIFIED'
+      ) {
+        return true;
+      }
+      // Oddiy ishchi Telegram Mini App orqali kirganda HECH QACHON admin bo'la olmaydi
+      return false;
+    }
+
+    // 2. Oddiy brauzerda (yoki Telegram WebApp initData bo'lmaganda):
+    // Faqat PIN-kod orqali tasdiqlangan `verifiedAdminTgId` bo'lsagina ruxsat beriladi!
+    if (!verifiedAdminTgId) {
+      return false;
+    }
+
+    if (
+      verifiedAdminTgId === 'PIN_VERIFIED_ADMIN' ||
+      verifiedAdminTgId === 'PAYROLL_PIN_VERIFIED'
+    ) {
       return true;
     }
 
-    // 2. Maxsus tasdiqlangan Telegram ID orqali
-    const checkTgId = verifiedAdminTgId || (currentUser.telegram_id ? String(currentUser.telegram_id).trim() : '');
-    if (checkTgId) {
-      if (checkTgId === '45701569' || checkTgId === settings.admin_telegram_id) return true;
-      const allAdmins = getAllAdminIds(settings, users);
-      if (allAdmins.includes(checkTgId)) return true;
-    }
+    return isUserAdminByTelegramId(verifiedAdminTgId, settings, users);
+  }, [currentUser, settings, users, verifiedAdminTgId, inTelegram, tgUserObj]);
 
-    // 3. Telegram WebApp ichida bo'lsa
-    if (tgUserObj) {
-      const tgIdStr = String(tgUserObj.id);
-      if (tgIdStr === '45701569' || tgIdStr === settings.admin_telegram_id) return true;
-      const allAdmins = getAllAdminIds(settings, users);
-      if (allAdmins.includes(tgIdStr)) return true;
-    }
-
-    return false;
-  }, [currentUser, settings, users, verifiedAdminTgId, tgUserObj]);
-
-  // Agar foydalanuvchi Admin bo'lmasa, uni admin bo'limlariga aslo o'tkazmaslik
+  // Agar foydalanuvchi Admin bo'lmasa, uni maxfiy admin boshqaruv bo'limlariga o'tkazmaslik
   useEffect(() => {
     if (!isAdmin) {
-      if (['workers', 'attendance', 'monthly_report', 'payroll', 'kpi_rating', 'reminders', 'admins', 'telegram_guide', 'settings'].includes(activeTab)) {
+      if (['workers', 'attendance', 'monthly_report', 'payroll', 'kpi_rating', 'reminders', 'admins', 'settings', 'telegram_guide'].includes(activeTab)) {
         setActiveTab('bot_screen');
       }
     }
   }, [isAdmin, activeTab]);
 
-  // Maxfiy Oylik (Payroll) bo'limiga kirish huquqi:
+  // Maxfiy Oylik (Payroll) bo'limiga kirish huquqi (faqat tasdiqlangan mas'ul admin uchun):
+  const effectiveVerifiedAdminId = useMemo(() => {
+    if (verifiedAdminTgId) return verifiedAdminTgId;
+    if (inTelegram && tgUserObj?.id && isUserAdminByTelegramId(tgUserObj.id, settings, users)) {
+      return String(tgUserObj.id).trim();
+    }
+    return null;
+  }, [verifiedAdminTgId, inTelegram, tgUserObj, settings, users]);
+
   const isPayrollAuthorized = useMemo(() => {
-    if (!currentUser) return false;
-    if (currentUser.role === 'admin') return true;
-    return isAdmin;
-  }, [currentUser, isAdmin]);
+    if (!isAdmin || !currentUser) return false;
+    return isUserAuthorizedForPayroll(currentUser, effectiveVerifiedAdminId, settings);
+  }, [isAdmin, currentUser, effectiveVerifiedAdminId, settings]);
 
   // 1. CLOUD FIRESTORE REAL-TIME SYNCHRONIZATION
   useEffect(() => {
@@ -176,13 +223,21 @@ export function App() {
 
           setCurrentUser((prevCurr) => {
             const urlParams = new URLSearchParams(window.location.search);
-            const workerTgId = urlParams.get('worker_tg_id');
+            const workerTgId = (urlParams.get('worker_tg_id') || '').trim();
             const autoAdmin = urlParams.get('auto_admin') === 'true';
+            const liveTg = getTelegramUser();
+            const savedSettings = loadState<MarketSettings>('settings', INITIAL_SETTINGS);
+            const savedVerifiedAdmin =
+              sessionStorage.getItem(ADMIN_AUTH_STORAGE_KEY) ||
+              localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
 
-            // Agar ishchi havola orqali ochgan bo'lsa, uni darhol o'z profiliga bog'laymiz
-            if (workerTgId && !autoAdmin) {
+            // Agar ishchi havola orqali ochgan bo'lsa (faqat oddiy ishchilar uchun, admin ID url orqali avto-ochilmaydi!)
+            if (workerTgId && !autoAdmin && !liveTg) {
+              if (isUserAdminByTelegramId(workerTgId, savedSettings, cloudUsers)) {
+                return savedVerifiedAdmin ? prevCurr : null;
+              }
               const matchedWorker = cloudUsers.find(
-                (u) => String(u.telegram_id || '').trim() === String(workerTgId).trim()
+                (u) => u.role === 'worker' && String(u.telegram_id || '').trim() === workerTgId
               );
               if (matchedWorker) {
                 try {
@@ -190,26 +245,45 @@ export function App() {
                 } catch {}
                 return matchedWorker;
               }
+              // Ro'yxatdan o'tmagan yangi odam bo'lsa — Login / Ro'yxatdan o'tish ekraniga yuboramiz!
+              try {
+                localStorage.removeItem('navo_current_user_id');
+              } catch {}
+              return null;
             }
 
             if (!prevCurr) {
               try {
                 const savedId = localStorage.getItem('navo_current_user_id');
-                const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
                 if (savedId) {
-                  if (savedId === '1' && !savedVerifiedAdmin) {
-                    // Ruxsatsiz Bosh Admin keshini tozalash
+                  const savedUser = cloudUsers.find((u) => String(u.id) === savedId);
+                  if (!savedUser) return null;
+                  const isAdmAccount =
+                    savedUser.id === 1 ||
+                    savedUser.role === 'admin' ||
+                    isUserAdminByTelegramId(savedUser.telegram_id, savedSettings, cloudUsers);
+                  if (isAdmAccount && !savedVerifiedAdmin && !liveTg) {
                     localStorage.removeItem('navo_current_user_id');
                     return null;
                   }
-                  const savedUser = cloudUsers.find((u) => String(u.id) === savedId);
-                  if (savedUser) return savedUser;
+                  return savedUser;
                 }
               } catch {}
               return null;
             }
-            const updated = cloudUsers.find((u) => u.id === prevCurr.id);
-            return updated || prevCurr;
+
+            const updated = cloudUsers.find((u) => u.id === prevCurr.id) || prevCurr;
+            const isUpdatedAdm =
+              updated.id === 1 ||
+              updated.role === 'admin' ||
+              isUserAdminByTelegramId(updated.telegram_id, savedSettings, cloudUsers);
+            if (isUpdatedAdm && !savedVerifiedAdmin && !liveTg) {
+              try {
+                localStorage.removeItem('navo_current_user_id');
+              } catch {}
+              return null;
+            }
+            return updated;
           });
         }
         setIsCloudConnected(true);
@@ -247,23 +321,11 @@ export function App() {
     };
   }, []);
 
-  // 2. Telegram WebApp orqali avtomatik foydalanuvchini va rolni aniqlash
+  // 2. Telegram WebApp va URL orqali foydalanuvchini va rolni QAT'IY XAVFSIZ aniqlash
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
-    const workerTgId = urlParams.get('worker_tg_id');
+    const workerTgId = (urlParams.get('worker_tg_id') || '').trim();
     const autoAdmin = urlParams.get('auto_admin') === 'true';
-
-    if (workerTgId && !autoAdmin) {
-      const foundWorker = users.find((u) => String(u.telegram_id || '').trim() === String(workerTgId).trim());
-      if (foundWorker) {
-        setCurrentUser(foundWorker);
-        try {
-          localStorage.setItem('navo_current_user_id', String(foundWorker.id));
-        } catch {}
-        setActiveTab('bot_screen');
-        return;
-      }
-    }
 
     const isTg = isTelegramWebApp();
     setInTelegram(isTg);
@@ -271,30 +333,20 @@ export function App() {
     const tgUser = getTelegramUser();
     if (tgUser) {
       setTgUserObj(tgUser);
-      const tgIdStr = String(tgUser.id);
+      const tgIdStr = String(tgUser.id).trim();
       const tgUsername = tgUser.username ? `@${tgUser.username.toLowerCase()}` : '';
 
-      const explicitDesignatedPayrollId = (settings.payroll_admin_id || '').trim();
-      const isPayrollUser = explicitDesignatedPayrollId
-        ? tgIdStr === explicitDesignatedPayrollId
-        : tgIdStr === '45701569';
-      const isAdminCheck = isPayrollUser || isUserAdminByTelegramId(tgUser.id, settings, users);
+      const explicitDesignatedPayrollId = (settings.payroll_admin_id || '45701569').trim();
+      const isPayrollUser = tgIdStr === explicitDesignatedPayrollId || tgIdStr === '45701569';
+      const isAdminCheck = isPayrollUser || isUserAdminByTelegramId(tgIdStr, settings, users);
 
       if (isAdminCheck) {
-        // Haqiqiy admin kirdi!
-        if (isPayrollUser) {
-          setVerifiedAdminTgId(tgIdStr);
-          try {
-            sessionStorage.setItem('navo_verified_admin_tg_id', tgIdStr);
-            localStorage.setItem('navo_verified_admin_tg_id', tgIdStr);
-          } catch {}
-        } else {
-          // Boshqa oddiy admin kirganda oylik tasdig'i tozalanadi
-          try {
-            sessionStorage.removeItem('navo_verified_admin_tg_id');
-            localStorage.removeItem('navo_verified_admin_tg_id');
-          } catch {}
-        }
+        // Haqiqiy Telegram Admin kirdi!
+        setVerifiedAdminTgId(tgIdStr);
+        try {
+          sessionStorage.setItem(ADMIN_AUTH_STORAGE_KEY, tgIdStr);
+          localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, tgIdStr);
+        } catch {}
 
         const existingAdmin = users.find(
           (u) =>
@@ -304,7 +356,7 @@ export function App() {
         );
 
         const adminObj: User = existingAdmin
-          ? { ...existingAdmin, telegram_id: tgIdStr }
+          ? { ...existingAdmin, telegram_id: tgIdStr, role: 'admin' }
           : {
               id: 1,
               telegram_id: tgIdStr,
@@ -322,18 +374,31 @@ export function App() {
           localStorage.setItem('navo_current_user_id', String(adminObj.id));
         } catch {}
 
-        // Agar maxfiy oylik ID egasi bo'lsa, to'g'ridan-to'g'ri oylik sahifasiga kiradi
         if (isPayrollUser) {
-          setActiveTab('payroll');
+          setActiveTab((prev) => (prev === 'bot_screen' ? 'payroll' : prev));
         } else {
-          setActiveTab((prev) => (prev === 'bot_screen' ? 'workers' : prev));
+          setActiveTab((prev) => (prev === 'bot_screen' || prev === 'payroll' ? 'workers' : prev));
         }
       } else {
-        // Ishchi kirdi!
+        // Oddiy ishchi yoki begona foydalanuvchi Telegram Mini App orqali kirdi!
+        // Har qanday eski admin tasdig'ini darhol o'chiramiz:
+        if (
+          verifiedAdminTgId &&
+          verifiedAdminTgId !== 'PIN_VERIFIED_ADMIN' &&
+          verifiedAdminTgId !== 'PAYROLL_PIN_VERIFIED'
+        ) {
+          setVerifiedAdminTgId(null);
+          try {
+            sessionStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+            localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+          } catch {}
+        }
+
         const matchedWorker = users.find(
           (u) =>
-            (u.telegram_id && String(u.telegram_id).trim() === tgIdStr) ||
-            (tgUsername && u.telegram_id && String(u.telegram_id).toLowerCase() === tgUsername)
+            u.role === 'worker' &&
+            ((u.telegram_id && String(u.telegram_id).trim() === tgIdStr) ||
+              (tgUsername && u.telegram_id && String(u.telegram_id).toLowerCase() === tgUsername))
         );
 
         if (matchedWorker) {
@@ -342,38 +407,77 @@ export function App() {
             localStorage.setItem('navo_current_user_id', String(matchedWorker.id));
           } catch {}
           setActiveTab('bot_screen');
-        } else {
-          // Ushbu Telegram ID hali birorta ham ishchiga bog'lanmagan
-          // Foydalanuvchini Arslon profiliga aslo tiqmaymiz!
+        } else if (users.length > 0) {
+          // Ushbu Telegram foydalanuvchisi hali ro'yxatdan o'tmagan — Kirish/Ro'yxatdan o'tish oynasini ochamiz!
           try {
-            const savedId = localStorage.getItem('navo_current_user_id');
-            if (savedId) {
-              const savedUser = users.find((u) => String(u.id) === savedId);
-              if (savedUser) {
-                setCurrentUser(savedUser);
-                setActiveTab('bot_screen');
-                return;
-              }
-            }
+            localStorage.removeItem('navo_current_user_id');
           } catch {}
           setCurrentUser(null);
+          setActiveTab('bot_screen');
         }
       }
-    } else if (!isTg) {
-      // Telegram WebApp bo'lmagan oddiy brauzerda ochilganda
+      return;
+    }
+
+    // Telegram WebApp bo'lmagan oddiy brauzerda (yoki botdan havola orqali) ochilganda:
+    if (workerTgId && !autoAdmin && users.length > 0) {
+      // Admin ID hech qachon oddiy URL parametr orqali PIN-kodsiz ochilmaydi!
+      if (isUserAdminByTelegramId(workerTgId, settings, users)) {
+        if (!verifiedAdminTgId) {
+          setCurrentUser(null);
+          setShowAdminLoginModal(true);
+        }
+        return;
+      }
+
+      const foundWorker = users.find(
+        (u) => u.role === 'worker' && String(u.telegram_id || '').trim() === workerTgId
+      );
+      if (foundWorker) {
+        setVerifiedAdminTgId(null);
+        setCurrentUser(foundWorker);
+        try {
+          sessionStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+          localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+          localStorage.setItem('navo_current_user_id', String(foundWorker.id));
+        } catch {}
+        setActiveTab('bot_screen');
+      } else {
+        // Yangi / ro'yxatdan o'tmagan foydalanuvchi -> Kirish ekrani
+        setVerifiedAdminTgId(null);
+        setCurrentUser(null);
+        try {
+          localStorage.removeItem('navo_current_user_id');
+        } catch {}
+        setActiveTab('bot_screen');
+      }
+      return;
+    }
+
+    if (!isTg) {
       if (autoAdmin && !verifiedAdminTgId) {
+        setCurrentUser(null);
         setShowAdminLoginModal(true);
       }
       try {
         const savedId = localStorage.getItem('navo_current_user_id');
-        const savedVerifiedAdmin = localStorage.getItem('navo_verified_admin_tg_id');
-        if (savedId) {
-          if (savedId === '1' && !savedVerifiedAdmin) {
+        const savedVerifiedAdmin =
+          sessionStorage.getItem(ADMIN_AUTH_STORAGE_KEY) ||
+          localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
+        if (savedId && users.length > 0) {
+          const savedUser = users.find((u) => String(u.id) === savedId);
+          if (!savedUser) {
             localStorage.removeItem('navo_current_user_id');
             setCurrentUser(null);
           } else {
-            const savedUser = users.find((u) => String(u.id) === savedId);
-            if (savedUser) {
+            const isSavedAdmin =
+              savedUser.id === 1 ||
+              savedUser.role === 'admin' ||
+              isUserAdminByTelegramId(savedUser.telegram_id, settings, users);
+            if (isSavedAdmin && !savedVerifiedAdmin) {
+              localStorage.removeItem('navo_current_user_id');
+              setCurrentUser(null);
+            } else {
               setCurrentUser(savedUser);
             }
           }
@@ -402,20 +506,19 @@ export function App() {
     localStorage.setItem('navo_time_attendances', JSON.stringify(attendances));
   }, [attendances]);
 
-  // Tizimdan chiqish (Logout) - Barcha foydalanuvchilar uchun alohida toza chiqish
+  // Tizimdan chiqish (Logout) - iframe va Telegram WebView ichida ham 100% ishonchli ishlaydi
   const handleLogout = () => {
     triggerHaptic('medium');
-    const ok = window.confirm(
-      isAdmin
-        ? "Admin paneldan chiqmoqchimisiz?"
-        : "Haqiqatan ham profilingizdan chiqmoqchimisiz?"
-    );
-    if (!ok) return;
-
     try {
       localStorage.removeItem('navo_current_user_id');
+      localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+      sessionStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
       localStorage.removeItem('navo_verified_admin_tg_id');
       sessionStorage.removeItem('navo_verified_admin_tg_id');
+      sessionStorage.removeItem('navo_payroll_vault_unlocked');
+      if (window.location.search) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
     } catch {}
     setVerifiedAdminTgId(null);
     setCurrentUser(null);
@@ -793,8 +896,8 @@ export function App() {
               const targetId = directTgId.trim();
               setVerifiedAdminTgId(targetId);
               try {
-                sessionStorage.setItem('navo_verified_admin_tg_id', targetId);
-                localStorage.setItem('navo_verified_admin_tg_id', targetId);
+                sessionStorage.setItem(ADMIN_AUTH_STORAGE_KEY, targetId);
+                localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, targetId);
               } catch {}
 
               const existingAdmin = users.find((u) => u.role === 'admin') || {
@@ -827,7 +930,7 @@ export function App() {
                 setActiveTab('workers');
               }
             } else {
-              // PIN bilan kirish (Oylik ko'rinmaydi, faqat ishchilar va davomat boshqaruvi)
+              // PIN bilan kirish
               const existingAdmin = users.find((u) => u.role === 'admin') || {
                 id: 1,
                 full_name: "Do'kon Ma'muri (Admin)",
@@ -841,14 +944,14 @@ export function App() {
 
               const pinAdminUser: User = {
                 ...existingAdmin,
-                telegram_id: undefined, // PIN bilan kirganda telegram_id qo'yilmaydi!
+                telegram_id: undefined,
                 role: 'admin',
               };
 
               setVerifiedAdminTgId('PIN_VERIFIED_ADMIN');
               try {
-                sessionStorage.setItem('navo_verified_admin_tg_id', 'PIN_VERIFIED_ADMIN');
-                localStorage.setItem('navo_verified_admin_tg_id', 'PIN_VERIFIED_ADMIN');
+                sessionStorage.setItem(ADMIN_AUTH_STORAGE_KEY, 'PIN_VERIFIED_ADMIN');
+                localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, 'PIN_VERIFIED_ADMIN');
                 localStorage.setItem('navo_current_user_id', String(pinAdminUser.id));
               } catch {}
 
@@ -873,8 +976,8 @@ export function App() {
           onSuccess={async (verifiedId) => {
             setVerifiedAdminTgId(verifiedId);
             try {
-              sessionStorage.setItem('navo_verified_admin_tg_id', verifiedId);
-              localStorage.setItem('navo_verified_admin_tg_id', verifiedId);
+              sessionStorage.setItem(ADMIN_AUTH_STORAGE_KEY, verifiedId);
+              localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, verifiedId);
             } catch {}
 
             const existingAdmin = users.find((u) => u.role === 'admin') || {
@@ -891,6 +994,7 @@ export function App() {
             const adminUser: User = {
               ...existingAdmin,
               telegram_id: verifiedId !== 'PIN_VERIFIED_ADMIN' ? verifiedId : undefined,
+              role: 'admin',
             };
 
             setCurrentUser(adminUser);
@@ -962,7 +1066,7 @@ export function App() {
         onRequestAdminLogin={!isAdmin ? () => setShowAdminLoginModal(true) : undefined}
         isCloudConnected={isCloudConnected}
         onOpenInstallModal={() => setShowPWAInstallModal(true)}
-        verifiedAdminTgId={verifiedAdminTgId}
+        verifiedAdminTgId={effectiveVerifiedAdminId}
         theme={theme}
         onToggleTheme={toggleTheme}
       />
@@ -993,6 +1097,16 @@ export function App() {
               users={users}
               attendances={attendances}
               forWorkerId={currentUser.id}
+            />
+          ) : activeTab === 'telegram_guide' ? (
+            <TelegramGuide
+              settings={settings}
+              onSaveSettings={async (newSettings) => {
+                if (isAdmin) {
+                  setSettings(newSettings);
+                  await saveSettingsToFirestore(newSettings);
+                }
+              }}
             />
           ) : (
             <WorkerPortal
@@ -1082,7 +1196,7 @@ export function App() {
                 users={users}
                 attendances={attendances}
                 currentUser={currentUser}
-                verifiedAdminTgId={verifiedAdminTgId}
+                verifiedAdminTgId={effectiveVerifiedAdminId}
                 onRequestAdminLogin={() => setShowAdminLoginModal(true)}
                 onUpdateSettings={async (newSettings) => {
                   setSettings(newSettings);
@@ -1126,23 +1240,6 @@ export function App() {
                   await saveSettingsToFirestore(newSettings);
                 }}
                 onUpdateUser={handleUpdateUser}
-              />
-            )}
-
-            {/* 5. Telegram Bot / Ishchi ekrani (Admin test qilishi uchun) */}
-            {activeTab === 'bot_screen' && (
-              <WorkerPortal
-                user={currentUser}
-                settings={settings}
-                attendances={attendances}
-                onCheckIn={handleWorkerCheckIn}
-                onStartBreak={handleStartBreak}
-                onEndBreak={handleEndBreak}
-                onCheckOut={handleWorkerCheckOut}
-                onOpenRegister={() => setShowSelfRegister(true)}
-                onLogout={handleLogout}
-                isAdmin={true}
-                onLinkTelegram={handleLinkTelegramUser}
               />
             )}
 
@@ -1200,7 +1297,7 @@ export function App() {
         setActiveTab={setActiveTab}
         onRequestAdminLogin={() => setShowAdminLoginModal(true)}
         onLogout={handleLogout}
-        verifiedAdminTgId={verifiedAdminTgId}
+        verifiedAdminTgId={effectiveVerifiedAdminId}
         payrollAdminId={settings.payroll_admin_id}
         isPayrollAuthorized={isPayrollAuthorized}
       />
@@ -1214,11 +1311,11 @@ export function App() {
         onSuccess={async (verifiedId) => {
           setVerifiedAdminTgId(verifiedId);
           try {
-            sessionStorage.setItem('navo_verified_admin_tg_id', verifiedId);
-            localStorage.setItem('navo_verified_admin_tg_id', verifiedId);
+            sessionStorage.setItem(ADMIN_AUTH_STORAGE_KEY, verifiedId);
+            localStorage.setItem(ADMIN_AUTH_STORAGE_KEY, verifiedId);
           } catch {}
 
-          // Admin foydalanuvchi ob'ektini yangilash
+          // Admin foydalanuvchi ob'ektini yangilash (begona Telegram ID lar avtomatik bazaga admin qilib yozilmaydi!)
           const existingAdmin = users.find((u) => u.role === 'admin') || {
             id: 1,
             full_name: "Bosh Admin",
@@ -1240,49 +1337,9 @@ export function App() {
             localStorage.setItem('navo_current_user_id', String(adminUser.id));
           } catch {}
 
-          // Agar foydalanuvchi Telegram ichida bo'lsa va PIN bilan kirgan bo'lsa,
-          // uning Telegram ID sini avtomatik adminlar ro'yxatiga qo'shamiz
-          if (inTelegram && tgUserObj?.id) {
-            const myTgId = String(tgUserObj.id);
-            const currentAdmins = settings.admins || [];
-            const currentAdminIds = getAllAdminIds(settings, users);
-            if (!currentAdminIds.includes(myTgId)) {
-              const newAdminObj = {
-                telegram_id: myTgId,
-                full_name: `${tgUserObj.first_name || ''} ${tgUserObj.last_name || ''}`.trim() || 'Admin',
-                phone: '',
-                role_title: "Do'kon Ma'muri",
-                added_at: new Date().toISOString(),
-                is_primary: currentAdmins.length === 0,
-              };
-              const updatedAdmins = [...currentAdmins, newAdminObj];
-              const updatedAdminIds = Array.from(new Set([...currentAdminIds, myTgId]));
-              const updatedSettings: MarketSettings = {
-                ...settings,
-                admins: updatedAdmins,
-                admin_ids: updatedAdminIds,
-                admin_telegram_id: updatedAdminIds.join(', '),
-              };
-              setSettings(updatedSettings);
-              await saveSettingsToFirestore(updatedSettings);
-            }
-          } else if (verifiedId && verifiedId !== 'PIN_VERIFIED_ADMIN') {
-            const existingAdmins = getAllAdminIds(settings, users);
-            if (!existingAdmins.includes(verifiedId)) {
-              const updatedSettings: MarketSettings = {
-                ...settings,
-                admin_telegram_id: settings.admin_telegram_id
-                  ? `${settings.admin_telegram_id}, ${verifiedId}`
-                  : verifiedId,
-              };
-              setSettings(updatedSettings);
-              await saveSettingsToFirestore(updatedSettings);
-            }
-          }
-
           const designatedPayroll = String(settings.payroll_admin_id || '45701569').trim();
-          if (verifiedId === designatedPayroll || verifiedId === '45701569') {
-            setActiveTab('payroll');
+          if (verifiedId === designatedPayroll || verifiedId === '45701569' || verifiedId === 'PIN_VERIFIED_ADMIN') {
+            setActiveTab('workers');
           } else {
             setActiveTab('workers');
           }

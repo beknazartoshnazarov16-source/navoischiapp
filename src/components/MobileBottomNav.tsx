@@ -12,6 +12,7 @@ import {
   Bell,
   Trophy,
   DollarSign,
+  Bot,
 } from 'lucide-react';
 import { triggerHaptic } from '../utils/telegram';
 
@@ -51,17 +52,11 @@ export function MobileBottomNav({
     setActiveTab(tabId);
   };
 
-  const userTg = String(currentUser?.telegram_id || '').trim();
-  const verifiedTg = String(verifiedAdminTgId || '').trim();
-  const explicitId = (payrollAdminId || '').trim();
-
-  const hasPayrollAccess = true;
-
   const navItems = isAdmin
     ? [
         { id: 'workers', label: 'Ishchilar', icon: Users },
         { id: 'attendance', label: 'Davomat', icon: Clock },
-        { id: 'payroll', label: 'Oylik', icon: DollarSign },
+        ...(isPayrollAuthorized ? [{ id: 'payroll', label: 'Oylik', icon: DollarSign }] : []),
         { id: 'monthly_report', label: 'Hisobot', icon: BarChart3 },
         { id: 'kpi_rating', label: 'KPI', icon: Trophy },
         { id: 'settings', label: 'Sozlama', icon: Settings },

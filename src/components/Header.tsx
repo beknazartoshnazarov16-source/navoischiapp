@@ -231,7 +231,7 @@ export function Header({
                 <span>📊 Oylik Hisobot</span>
               </button>
 
-              {(isPayrollAuthorized || isAdmin) && (
+              {isPayrollAuthorized && (
                 <button
                   onClick={() => setActiveTab('payroll')}
                   className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold transition-all whitespace-nowrap cursor-pointer ${
@@ -344,6 +344,18 @@ export function Header({
               >
                 <Clock className="w-4 h-4" />
                 <span>⏱ Mening Oylik Soatlarim</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('telegram_guide')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition-all whitespace-nowrap cursor-pointer ${
+                  activeTab === 'telegram_guide'
+                    ? 'bg-sky-600 text-white shadow-xs'
+                    : 'text-sky-700 bg-sky-50/70 hover:bg-sky-100'
+                }`}
+              >
+                <Bot className="w-4 h-4" />
+                <span>🤖 Telegram Boti</span>
               </button>
             </>
           )}

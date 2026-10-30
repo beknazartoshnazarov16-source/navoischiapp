@@ -78,28 +78,21 @@ export function isUserAuthorizedForPayroll(
   verifiedTgId: string | null | undefined,
   settings?: MarketSettings
 ): boolean {
-  // 1. Agar foydalanuvchi admin rolida bo'lsa yoki admin PIN bilan tasdiqlangan bo'lsa
-  if (user?.role === 'admin') return true;
-  if (verifiedTgId === 'PIN_VERIFIED_ADMIN') return true;
-
-  const userTgId = String(user?.telegram_id || '').trim();
+  if (!user) return false;
   const verifiedId = String(verifiedTgId || '').trim();
-  const explicitDesignatedAdmin = (settings?.payroll_admin_id || '').trim();
+  if (!verifiedId) return false;
 
-  // 2. Agar Telegram ID belgilangan admin ID si bilan mos kelsa
-  if (explicitDesignatedAdmin && (userTgId === explicitDesignatedAdmin || verifiedId === explicitDesignatedAdmin)) {
+  if (verifiedId === 'PIN_VERIFIED_ADMIN' || verifiedId === 'PAYROLL_PIN_VERIFIED') {
     return true;
   }
 
-  // 3. Super admin ID (45701569)
-  if (userTgId === DEFAULT_SUPER_ADMIN_TG_ID || verifiedId === DEFAULT_SUPER_ADMIN_TG_ID) {
+  const explicitDesignatedAdmin = (settings?.payroll_admin_id || DEFAULT_SUPER_ADMIN_TG_ID).trim();
+  if (explicitDesignatedAdmin && verifiedId === explicitDesignatedAdmin) {
     return true;
   }
 
-  // 4. Boshqa adminlar ro'yxatida bo'lsa
-  if (verifiedId) {
-    const allAdminIds = getAllAdminIds(settings || ({} as any), []);
-    if (allAdminIds.includes(verifiedId)) return true;
+  if (verifiedId === DEFAULT_SUPER_ADMIN_TG_ID) {
+    return true;
   }
 
   return false;

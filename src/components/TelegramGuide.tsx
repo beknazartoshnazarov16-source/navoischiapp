@@ -28,7 +28,7 @@ export function TelegramGuide({ settings, onSaveSettings }: TelegramGuideProps) 
 
   // Ommaviy havola (ais-pre) — yangi ishchilardan hech qanday Google akkaunt so'ramaydi!
   const rawOrigin = typeof window !== 'undefined' ? window.location.origin : '';
-  const publicAppUrl = rawOrigin.replace('ais-dev-', 'ais-pre-') || 'https://ais-pre-sn5pew5d4v6dsgb6ijaf5d-752669647478.asia-southeast1.run.app';
+  const publicAppUrl = rawOrigin.replace('ais-dev-', 'ais-pre-') || 'https://ais-pre-jzx3h6wrsjjnjrsu6xnas6-3620319891.asia-east1.run.app';
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
@@ -185,8 +185,12 @@ export function TelegramGuide({ settings, onSaveSettings }: TelegramGuideProps) 
               Loyihangiz ichida <code>telegram_bot.py</code> fayli tayyor holatda mavjud. U SQLite bazaga ega, tuni bilan 00:00 dan keyin ketsa ham, erta ketsa ham soatlarini to'liq hisoblaydi!
             </p>
 
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-[11px] text-rose-900 mb-3 leading-relaxed">
+              <b>⚠️ Muhim eslatma:</b> Botingiz allaqachon <b>Google Cloud serverida 24/7 avtomatik ishlab turibdi</b>. Aynan bir xil Bot Token bilan kompyuterda <code>telegram_bot.py</code> ni qo'shimcha yoqmang — aks holda bitta xabarga 2 ta joydan javob qaytib ketadi! Ushbu fayl faqat alohida zaxira token uchun mo'ljallangan.
+            </div>
+
             <div className="p-3 bg-slate-900 text-slate-200 rounded-xl font-mono text-xs mb-4 space-y-1">
-              <div className="text-emerald-400"># O'rnatish va ishga tushirish:</div>
+              <div className="text-emerald-400"># Zaxira sifatida ishga tushirish:</div>
               <div>pip install pyTelegramBotAPI</div>
               <div>python telegram_bot.py</div>
             </div>

@@ -20,21 +20,8 @@ export const INITIAL_SETTINGS: MarketSettings = {
   auto_checkout_distance_meters: 100,
 };
 
-// Faqat bitta asosiy Admin foydalanuvchisi qoldirildi, barcha eski soxta ishchilar to'liq o'chirib tashlandi!
-export const INITIAL_USERS: User[] = [
-  {
-    id: 1,
-    telegram_id: '45701569',
-    full_name: 'Beknazar Toshnazarov (Admin)',
-    phone: '+99890 123 45 67',
-    role: 'admin',
-    position: 'Do\'kon egasi / Bosh Admin',
-    work_start_time: '08:00',
-    work_end_time: '20:00',
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-];
+// Foydalanuvchilar faqat Firestore bazasidan yuklanadi — yangi kirganlarga hech qachon Admin profili ochilib ketmasligi uchun bo'sh!
+export const INITIAL_USERS: User[] = [];
 
 // Bo'sh boshlang'ich davomat ro'yxati (hech qanday soxta yozuvlar yo'q)
 export const INITIAL_ATTENDANCE: Attendance[] = [];

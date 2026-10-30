@@ -184,7 +184,7 @@ export async function sendTelegramNotification(
 
       try {
         // 1. Avval server API proxy orqali jo'natib ko'ramiz (CORS muammosiz)
-        let sentOk = false;
+        let proxyHandled = false;
         try {
           const proxyRes = await fetch('/api/telegram/send', {
             method: 'POST',
@@ -196,15 +196,18 @@ export async function sendTelegramNotification(
             }),
           });
           if (proxyRes.ok) {
+            proxyHandled = true;
             const proxyData = await proxyRes.json();
             if (proxyData.ok) {
               anySuccess = true;
-              sentOk = true;
               if (proxyData.migrated_to) {
                 discoveredNewChatId = String(proxyData.migrated_to);
               }
             } else {
               const mig = proxyData.parameters?.migrate_to_chat_id;
+              if (mig) {
+                discoveredNewChatId = String(mig);
+              }
               lastError = translateTelegramError(proxyData.description || proxyData.error, targetId, mig ? String(mig) : undefined);
             }
           }
@@ -212,7 +215,7 @@ export async function sendTelegramNotification(
           // Proxy ishlamasa bevosita Telegramga yuboramiz
         }
 
-        if (sentOk) return;
+        if (proxyHandled) return;
 
         // 2. Bevosita Telegram API ga yuborish
         const response = await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {

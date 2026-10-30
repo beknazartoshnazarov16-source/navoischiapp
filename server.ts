@@ -98,36 +98,57 @@ async function startServer() {
     }
   });
 
-  // 4. TELEGRAM WEBHOOK ENDPOINT (0.05s TEZLIKDA JAVOB, KOMPYUTER O'CHSA HAM 24/7 BULUTDA ISHLAYDI)
+  // 4. TELEGRAM WEBHOOK ENDPOINT (Cloud Run CPU o'chib qolmasligi uchun javobdan oldin qayta ishlanadi)
   app.all(['/api/telegram-webhook', '/api/telegram-webhook/'], async (req: Request, res: Response) => {
-    // Har qanday so'rovga darhol 200 OK qaytariladi (Telegram talabi)
-    res.status(200).json({ ok: true });
     try {
       if (req.method === 'POST' && req.body && req.body.update_id !== undefined) {
-        await cloudTelegramBot.handleWebhookUpdate(req.body, req);
+        await Promise.race([
+          cloudTelegramBot.handleWebhookUpdate(req.body, req),
+          new Promise((resolve) => setTimeout(resolve, 9000)),
+        ]);
       }
     } catch (err: any) {
       console.error('[Telegram Webhook Error]', err?.message || err);
     }
+    if (!res.headersSent) {
+      res.status(200).json({ ok: true });
+    }
   });
 
-  // 5. Telegram Webhook-ni o'rnatish
-  app.post('/api/telegram/webhook/set', async (req: Request, res: Response) => {
+  // 5. 24/7 Bulutli Botni qayta ulash va tekshirish (Webhook xatolarini tozalab Long Pollingni faollashtiradi)
+  app.post('/api/telegram/reconnect', async (req: Request, res: Response) => {
     try {
-      let origin = (req.body?.url || `${req.protocol}://${req.get('host')}`).trim();
-      // Telegram webhook qat'iy ravishda HTTPS bo'lishi shart!
-      if (origin.startsWith('http://') && !origin.includes('localhost')) {
-        origin = origin.replace('http://', 'https://');
-      }
-      const webhookUrl = `${origin.replace(/\/$/, '')}/api/telegram-webhook`;
-      const result = await cloudTelegramBot.setWebhook(webhookUrl);
+      cloudTelegramBot.updateBaseUrl(req);
+      const result = await cloudTelegramBot.reconnectAndVerify(req.body?.token);
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || 'Xatolik' });
     }
   });
 
-  // 6. Telegram Webhook-ni o'chirish (Polling rejimiga qaytish)
+  // 6. Telegram Bulutli Rejim / Webhook sozlash (.run.app cookie himoyasi tufayli 24/7 Cloud Polling ishlatiladi)
+  app.post('/api/telegram/webhook/set', async (req: Request, res: Response) => {
+    try {
+      cloudTelegramBot.updateBaseUrl(req);
+      let origin = (req.body?.url || `${req.protocol}://${req.get('host')}`).trim();
+      if (origin.startsWith('http://') && !origin.includes('localhost')) {
+        origin = origin.replace('http://', 'https://');
+      }
+      // AI Studio Cloud Run (*.run.app) tashqi POST so'rovlarga 302 cookie-check qaytaradi,
+      // shu sababli vebxuk o'rniga 100% ishonchli 24/7 Cloud Long Polling yoqiladi!
+      if (origin.includes('.run.app') && req.body?.forceWebhook !== true) {
+        const result = await cloudTelegramBot.reconnectAndVerify(req.body?.token);
+        return res.json(result);
+      }
+      const webhookUrl = `${origin.replace(/\/$/, '')}/api/telegram-webhook`;
+      const result = await cloudTelegramBot.setWebhook(webhookUrl);
+      return res.json(result);
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: err?.message || 'Xatolik' });
+    }
+  });
+
+  // 7. Telegram Webhook-ni o'chirish (Polling rejimiga qaytish)
   app.post('/api/telegram/webhook/delete', async (req: Request, res: Response) => {
     try {
       const result = await cloudTelegramBot.deleteWebhook();
@@ -137,7 +158,7 @@ async function startServer() {
     }
   });
 
-  // 7. Telegram Webhook holatini tekshirish
+  // 8. Telegram Webhook holatini tekshirish
   app.get('/api/telegram/webhook/info', async (req: Request, res: Response) => {
     try {
       const result = await cloudTelegramBot.getWebhookInfo();
@@ -160,7 +181,7 @@ async function startServer() {
   // Dev va Prod rejimlarini moslashtirish
   const distPath = path.join(__dirname, 'dist');
   const distExists = fs.existsSync(distPath);
-  const isProduction = process.env.NODE_ENV === 'production' || distExists;
+  const isProduction = process.env.NODE_ENV === 'production';
 
   if (isProduction && distExists) {
     app.use(express.static(distPath));
