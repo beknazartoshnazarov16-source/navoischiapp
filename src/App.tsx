@@ -35,6 +35,8 @@ import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   getLocalDateString,
   calculateLateMinutes,
+  calculateLatePenaltyAmount,
+  formatUzSum,
   getTashkentTimeString,
   formatMinutesToHours,
 } from './utils/calculations';
@@ -660,17 +662,35 @@ export function App() {
     await saveUserToFirestore(updatedUser).catch(console.error);
   };
 
-  const sendNotification = (msg: string) => {
-    const rawTargets = [
-      settings.admin_telegram_id,
-      settings.group_telegram_id,
+  const sendNotification = (publicMsg: string, privateAdminMsg?: string) => {
+    if (!settings.bot_token) return;
+
+    const rawAdminTargets = [
+      ...(settings.admin_telegram_id || '').split(/[,;\s]+/),
       ...(settings.admin_ids || []),
-    ].filter(Boolean);
+      ...(settings.admins || []).map((a) => String(a.telegram_id || '')),
+    ]
+      .map((s) => String(s || '').trim())
+      .filter((s) => s && !s.startsWith('-') && s !== '123456789');
 
-    const targets = Array.from(new Set(rawTargets.map((t) => String(t).trim()))).join(', ');
+    const rawGroupTargets = (settings.group_telegram_id || '')
+      .split(/[,;\s]+/)
+      .map((s) => String(s || '').trim())
+      .filter((s) => s && s.startsWith('-'));
 
-    if (settings.bot_token && targets) {
-      sendTelegramNotification(settings.bot_token, targets, msg)
+    const uniqueAdmins = Array.from(new Set(rawAdminTargets));
+    const uniqueGroups = Array.from(new Set(rawGroupTargets));
+
+    if (uniqueAdmins.length > 0) {
+      sendTelegramNotification(
+        settings.bot_token,
+        uniqueAdmins.join(', '),
+        privateAdminMsg || publicMsg
+      ).catch((e) => console.error('Telegram admin notification error:', e));
+    }
+
+    if (uniqueGroups.length > 0) {
+      sendTelegramNotification(settings.bot_token, uniqueGroups.join(', '), publicMsg)
         .then((res) => {
           if (res.migratedTo && res.migratedTo !== settings.group_telegram_id) {
             console.log('Superguruh migratsiyasi aniqlandi:', res.migratedTo);
@@ -679,7 +699,7 @@ export function App() {
             saveSettingsToFirestore(updated).catch(console.error);
           }
         })
-        .catch((e) => console.error('Telegram notification error:', e));
+        .catch((e) => console.error('Telegram group notification error:', e));
     }
   };
 
@@ -688,6 +708,20 @@ export function App() {
     const now = new Date();
     const todayDate = getLocalDateString(now);
     const timeStr = getTashkentTimeString(now, true);
+
+    // Bugungi mavjud/tugallangan smenalarni hisoblash
+    const todayShifts = attendances.filter(
+      (a) => a.user_id === currentUser.id && a.date === todayDate && a.status === 'completed'
+    );
+    const isFirstShift = todayShifts.length === 0;
+    const shiftNumber = todayShifts.length + 1;
+
+    const penaltyInfo = calculateLatePenaltyAmount(
+      timeStr,
+      currentUser.work_start_time || '08:00',
+      shiftNumber,
+      settings
+    );
 
     const newAttendance: Attendance = {
       id: Date.now(),
@@ -698,6 +732,9 @@ export function App() {
       check_in_lon: lon,
       total_break_minutes: 0,
       worked_minutes: 0,
+      late_minutes: penaltyInfo.lateMinutes,
+      chargeable_late_minutes: penaltyInfo.chargeableLateMinutes,
+      late_penalty: penaltyInfo.penaltyAmount,
       status: 'working',
       created_at: now.toISOString(),
     };
@@ -713,21 +750,10 @@ export function App() {
       console.error('Error saving check-in to Firestore:', e)
     );
 
-    // Bugungi mavjud/tugallangan smenalarni hisoblash
-    const todayShifts = attendances.filter(
-      (a) => a.user_id === currentUser.id && a.date === todayDate
-    );
-    const isFirstShift = todayShifts.length === 0;
-    const shiftNumber = todayShifts.length + 1;
-
-    let lateMins = 0;
+    const lateMins = penaltyInfo.lateMinutes;
     let lateText = '';
 
     if (isFirstShift) {
-      lateMins = calculateLateMinutes(
-        timeStr,
-        currentUser.work_start_time || '08:00'
-      );
       lateText = lateMins > 0 ? `⚠️ ${lateMins} daqiqa kechikdi` : `✅ O'z vaqtida keldi`;
     } else {
       lateText = `🔄 ${shiftNumber}-smena (Qaytadan kirish — kechikish hisoblanmaydi)`;
@@ -736,41 +762,45 @@ export function App() {
     const locText = lat && lon ? `📍 Do'konda (GPS tasdiqlandi)` : `📱 Mini App orqali`;
     const shiftBadge = shiftNumber > 1 ? ` (${shiftNumber}-smena)` : '';
 
-    const msg = `🟢 <b>${settings.shop_name} — Ishga keldi${shiftBadge}</b>\n\n` +
+    const publicMsg =
+      `🟢 <b>${settings.shop_name} — Ishga keldi${shiftBadge}</b>\n\n` +
       `👤 <b>Xodim:</b> ${currentUser.full_name} (${currentUser.position || 'Xodim'})\n` +
       `⏰ <b>Kelgan vaqti:</b> ${timeStr.slice(0, 5)} (${todayDate})\n` +
       `⏱ <b>Ish rejasi:</b> ${currentUser.work_start_time || '08:00'} - ${currentUser.work_end_time || '20:00'} [${lateText}]\n` +
       `📍 <b>Lokatsiya:</b> ${locText}`;
 
-    sendNotification(msg);
+    const adminPenaltyExtra =
+      isFirstShift && penaltyInfo.penaltyAmount > 0
+        ? `\n⚠️ <b>Kechikish jarimasi (Maxfiy/Admin):</b> <b>${formatUzSum(penaltyInfo.penaltyAmount)}</b> (${penaltyInfo.chargeableLateMinutes} daq × ${(settings.late_penalty_per_minute_sum ?? 1000).toLocaleString()} so'm)`
+        : '';
+
+    sendNotification(publicMsg, publicMsg + adminPenaltyExtra);
   };
 
   const handleStartBreak = () => {
     if (!currentUser) return;
     const now = new Date();
-    let updatedTarget: Attendance | null = null;
-    setAttendances((prev) =>
-      prev.map((a) => {
-        if (a.user_id === currentUser.id && a.status === 'working') {
-          const updated: Attendance = {
-            ...a,
-            status: 'on_break',
-            note: `Tanaffus: ${Date.now()}`,
-          };
-          updatedTarget = updated;
-          return updated;
-        }
-        return a;
-      })
+    const targetAtt = attendances.find(
+      (a) => a.user_id === currentUser.id && a.status === 'working'
     );
-    if (updatedTarget) {
-      saveAttendanceToFirestore(updatedTarget).catch((e) =>
-        console.error('Error saving break to Firestore:', e)
-      );
-    }
+    if (!targetAtt) return;
+
+    const updatedTarget: Attendance = {
+      ...targetAtt,
+      status: 'on_break',
+      note: `Tanaffus: ${Date.now()}`,
+    };
+
+    setAttendances((prev) =>
+      prev.map((a) => (a.id === updatedTarget.id ? updatedTarget : a))
+    );
+    saveAttendanceToFirestore(updatedTarget).catch((e) =>
+      console.error('Error saving break to Firestore:', e)
+    );
 
     const timeStr = getTashkentTimeString(now, false);
-    const msg = `☕️ <b>${settings.shop_name} — Tanaffusga chiqdi</b>\n\n` +
+    const msg =
+      `☕️ <b>${settings.shop_name} — Tanaffusga chiqdi</b>\n\n` +
       `👤 <b>Xodim:</b> ${currentUser.full_name}\n` +
       `⏰ <b>Vaqt:</b> ${timeStr}`;
     sendNotification(msg);
@@ -779,46 +809,41 @@ export function App() {
   const handleEndBreak = () => {
     if (!currentUser) return;
     const now = new Date();
-    let updatedTarget: Attendance | null = null;
-    let breakMinutes = 1;
-
-    setAttendances((prev) =>
-      prev.map((a) => {
-        if (a.user_id === currentUser.id && a.status === 'on_break') {
-          if (a.note && a.note.startsWith('Tanaffus: ')) {
-            try {
-              const raw = a.note.replace('Tanaffus: ', '').trim();
-              const startMs = /^\d+$/.test(raw) ? parseInt(raw, 10) : new Date(raw).getTime();
-              const diffMs = Date.now() - startMs;
-              breakMinutes = Math.max(1, Math.round(diffMs / 60000));
-              if (breakMinutes > 180) breakMinutes = 30;
-            } catch {
-              breakMinutes = 15;
-            }
-          } else {
-            breakMinutes = 15;
-          }
-
-          const updated: Attendance = {
-            ...a,
-            status: 'working',
-            total_break_minutes: (a.total_break_minutes || 0) + breakMinutes,
-            note: undefined,
-          };
-          updatedTarget = updated;
-          return updated;
-        }
-        return a;
-      })
+    const targetAtt = attendances.find(
+      (a) => a.user_id === currentUser.id && a.status === 'on_break'
     );
-    if (updatedTarget) {
-      saveAttendanceToFirestore(updatedTarget).catch((e) =>
-        console.error('Error saving break end to Firestore:', e)
-      );
+    if (!targetAtt) return;
+
+    let breakMinutes = 15;
+    if (targetAtt.note && targetAtt.note.startsWith('Tanaffus: ')) {
+      try {
+        const raw = targetAtt.note.replace('Tanaffus: ', '').trim();
+        const startMs = /^\d+$/.test(raw) ? parseInt(raw, 10) : new Date(raw).getTime();
+        const diffMs = Date.now() - startMs;
+        breakMinutes = Math.max(1, Math.round(diffMs / 60000));
+        if (breakMinutes > 180) breakMinutes = 30;
+      } catch {
+        breakMinutes = 15;
+      }
     }
 
+    const updatedTarget: Attendance = {
+      ...targetAtt,
+      status: 'working',
+      total_break_minutes: (targetAtt.total_break_minutes || 0) + breakMinutes,
+      note: undefined,
+    };
+
+    setAttendances((prev) =>
+      prev.map((a) => (a.id === updatedTarget.id ? updatedTarget : a))
+    );
+    saveAttendanceToFirestore(updatedTarget).catch((e) =>
+      console.error('Error saving break end to Firestore:', e)
+    );
+
     const timeStr = getTashkentTimeString(now, false);
-    const msg = `▶️ <b>${settings.shop_name} — Tanaffus yakunlandi</b>\n\n` +
+    const msg =
+      `▶️ <b>${settings.shop_name} — Tanaffus yakunlandi</b>\n\n` +
       `👤 <b>Xodim:</b> ${currentUser.full_name}\n` +
       `⏰ <b>Qaytdi:</b> ${timeStr} (Tanaffus: ${breakMinutes} daqiqa)`;
     sendNotification(msg);
@@ -831,32 +856,61 @@ export function App() {
     autoReason?: string
   ) => {
     if (!currentUser) return;
-    let updatedTarget: Attendance | null = null;
-    setAttendances((prev) =>
-      prev.map((a) => {
-        if (
-          a.user_id === currentUser.id &&
-          (a.status === 'working' || a.status === 'on_break')
-        ) {
-          const updated: Attendance = {
-            ...a,
-            status: 'completed',
-            check_out_date: checkOutDate,
-            check_out_time: checkOutTime,
-            worked_minutes: workedMinutes,
-            note: autoReason ? `Avtomatik ketish: ${autoReason}` : a.note,
-          };
-          updatedTarget = updated;
-          return updated;
-        }
-        return a;
-      })
+
+    const targetAtt = attendances.find(
+      (a) =>
+        a.user_id === currentUser.id &&
+        (a.status === 'working' || a.status === 'on_break')
     );
-    if (updatedTarget) {
-      saveAttendanceToFirestore(updatedTarget).catch((e) =>
-        console.error('Error saving check-out to Firestore:', e)
+    if (!targetAtt) return;
+
+    const sameDayShifts = attendances
+      .filter((item) => item.user_id === currentUser.id && item.date === targetAtt.date)
+      .sort(
+        (x, y) =>
+          (x.check_in_time || '').localeCompare(y.check_in_time || '') || x.id - y.id
       );
-    }
+    const shiftIdx = Math.max(
+      1,
+      sameDayShifts.findIndex((item) => item.id === targetAtt.id) + 1
+    );
+
+    // Smena yakunlanganda kechikkan daqiqalar va jarimani avtomatik hisoblab Attendance ob'ektiga qo'shib saqlash
+    const isBossOrAdmin =
+      currentUser.role === 'admin' ||
+      /boshliq|admin|rahbar|direktor|owner/i.test(currentUser.position || '');
+
+    const penaltyInfo = isBossOrAdmin
+      ? { lateMinutes: 0, chargeableLateMinutes: 0, penaltyAmount: 0 }
+      : calculateLatePenaltyAmount(
+          targetAtt.check_in_time,
+          currentUser.work_start_time || '08:00',
+          shiftIdx,
+          settings
+        );
+
+    const computedLateMinutes = penaltyInfo.lateMinutes;
+    const computedChargeableMinutes = penaltyInfo.chargeableLateMinutes;
+    const computedLatePenalty = penaltyInfo.penaltyAmount;
+
+    const updatedTarget: Attendance = {
+      ...targetAtt,
+      status: 'completed',
+      check_out_date: checkOutDate,
+      check_out_time: checkOutTime,
+      worked_minutes: workedMinutes,
+      late_minutes: computedLateMinutes,
+      chargeable_late_minutes: computedChargeableMinutes,
+      late_penalty: computedLatePenalty,
+      note: autoReason ? `Avtomatik ketish: ${autoReason}` : targetAtt.note,
+    };
+
+    setAttendances((prev) =>
+      prev.map((a) => (a.id === updatedTarget.id ? updatedTarget : a))
+    );
+    saveAttendanceToFirestore(updatedTarget).catch((e) =>
+      console.error('Error saving check-out to Firestore:', e)
+    );
 
     const hours = Math.floor(workedMinutes / 60);
     const mins = workedMinutes % 60;
@@ -870,14 +924,29 @@ export function App() {
       ? `📍 <b>Sabab:</b> ${autoReason}\n`
       : '';
 
-    const msg = `${titlePrefix}\n\n` +
+    const publicMsg =
+      `${titlePrefix}\n\n` +
       `👤 <b>Xodim:</b> ${currentUser.full_name} (${currentUser.position || 'Xodim'})\n` +
       `⏰ <b>Ketgan vaqti:</b> ${checkOutTime.slice(0, 5)} (${checkOutDate})\n` +
       `⏱ <b>Ishlagan vaqti:</b> <b>${workedStr}</b> (${(workedMinutes / 60).toFixed(1)} soat)\n` +
       reasonLine +
       `✅ Davomat Google Firestore bazasiga yozildi.`;
 
-    sendNotification(msg);
+    const adminPenaltyLine =
+      computedLatePenalty > 0
+        ? `⚠️ <b>Smena kechikish jarimasi (Maxfiy/Admin):</b> <b>${formatUzSum(computedLatePenalty)}</b> (${computedLateMinutes} daq kechikish, ${computedChargeableMinutes} daq jarima)\n`
+        : '';
+
+    const adminMsg =
+      `${titlePrefix}\n\n` +
+      `👤 <b>Xodim:</b> ${currentUser.full_name} (${currentUser.position || 'Xodim'})\n` +
+      `⏰ <b>Ketgan vaqti:</b> ${checkOutTime.slice(0, 5)} (${checkOutDate})\n` +
+      `⏱ <b>Ishlagan vaqti:</b> <b>${workedStr}</b> (${(workedMinutes / 60).toFixed(1)} soat)\n` +
+      adminPenaltyLine +
+      reasonLine +
+      `✅ Davomat Google Firestore bazasiga yozildi.`;
+
+    sendNotification(publicMsg, adminMsg);
   };
 
   // Agar foydalanuvchi hali kirmagan bo'lsa (yoki Chiqish bosgan bo'lsa), LoginScreen ko'rsatamiz!
@@ -1096,6 +1165,7 @@ export function App() {
             <MonthlyHoursReport
               users={users}
               attendances={attendances}
+              settings={settings}
               forWorkerId={currentUser.id}
             />
           ) : activeTab === 'telegram_guide' ? (
@@ -1155,6 +1225,7 @@ export function App() {
               <MonthlyHoursReport
                 users={users}
                 attendances={attendances}
+                settings={settings}
                 forWorkerId={currentUser.id}
               />
             )}
@@ -1174,6 +1245,7 @@ export function App() {
               <AttendanceManager
                 users={users}
                 attendances={attendances}
+                settings={settings}
                 onAddAttendance={handleAddAttendance}
                 onUpdateAttendance={handleUpdateAttendance}
                 onDeleteAttendance={handleDeleteAttendance}
@@ -1185,6 +1257,7 @@ export function App() {
               <MonthlyHoursReport
                 users={users}
                 attendances={attendances}
+                settings={settings}
                 onNavigateToPayroll={() => setActiveTab('payroll')}
               />
             )}

@@ -14,6 +14,8 @@ import {
   getTashkentTimeString,
   parseTimeParts,
   parseDateParts,
+  calculateLatePenaltyAmount,
+  formatUzSum,
 } from '../utils/calculations';
 import {
   Clock,
@@ -85,6 +87,7 @@ export function WorkerPortal({
   const [currentDistanceToShop, setCurrentDistanceToShop] = useState<number | null>(null);
   const [autoCheckoutNotice, setAutoCheckoutNotice] = useState<string | null>(null);
   const autoCheckoutTriggeredRef = useRef<boolean>(false);
+  const outOfBoundsCounterRef = useRef<number>(0);
 
   const autoCheckoutDistanceLimit = settings.auto_checkout_distance_meters || 100;
   const isAutoCheckoutEnabled = settings.auto_checkout_on_distance_enabled !== false;
@@ -127,6 +130,63 @@ export function WorkerPortal({
     (sum, a) => sum + getAccurateAttendanceMinutes(a),
     0
   );
+
+  // Ushbu ishchining shu oydagi barcha (tugallangan + hozir ishlayotgan) yozuvlari (kechikish va jarima darhol ko'rinishi uchun)
+  const userMonthAllAttendances = attendances.filter(
+    (a) =>
+      a.user_id === user.id &&
+      (a.date || '').slice(0, 7) === currentMonthStr
+  );
+
+  const monthlyLatePenaltySummary = React.useMemo(() => {
+    let totalLateMins = 0;
+    let totalChargeableMins = 0;
+    let totalPenaltySum = 0;
+    const lateItems: {
+      date: string;
+      checkInTime: string;
+      lateMinutes: number;
+      chargeableMinutes: number;
+      penaltyAmount: number;
+      isActive: boolean;
+    }[] = [];
+
+    const dateMap = new Map<string, Attendance[]>();
+    userMonthAllAttendances.forEach((a) => {
+      const list = dateMap.get(a.date) || [];
+      list.push(a);
+      dateMap.set(a.date, list);
+    });
+
+    dateMap.forEach((shifts, dateStr) => {
+      shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+      const firstShift = shifts[0];
+      if (firstShift && firstShift.check_in_time) {
+        const res = calculateLatePenaltyAmount(
+          firstShift.check_in_time,
+          user.work_start_time || '08:00',
+          1,
+          settings
+        );
+        if (res.lateMinutes > 0) {
+          totalLateMins += res.lateMinutes;
+          totalChargeableMins += res.chargeableLateMinutes;
+          totalPenaltySum += res.penaltyAmount;
+          lateItems.push({
+            date: dateStr,
+            checkInTime: firstShift.check_in_time,
+            lateMinutes: res.lateMinutes,
+            chargeableMinutes: res.chargeableLateMinutes,
+            penaltyAmount: res.penaltyAmount,
+            isActive: firstShift.status !== 'completed',
+          });
+        }
+      }
+    });
+
+    lateItems.sort((a, b) => b.date.localeCompare(a.date));
+    return { totalLateMins, totalChargeableMins, totalPenaltySum, lateItems };
+  }, [userMonthAllAttendances, user.work_start_time, settings]);
 
   // Telegram native MainButton integratsiyasi
   useEffect(() => {
@@ -315,16 +375,18 @@ export function WorkerPortal({
 
   // Smena o'zgarganda avtomatik ketish trigger holatini yangilash
   useEffect(() => {
-    if (!activeAttendance) {
+    if (!activeAttendance || activeAttendance.status !== 'working') {
       autoCheckoutTriggeredRef.current = false;
+      outOfBoundsCounterRef.current = 0;
       setCurrentDistanceToShop(null);
     }
-  }, [activeAttendance]);
+  }, [activeAttendance?.id, activeAttendance?.status]);
 
   // 100 metr Geozona monitoringi: ishchi do'kondan uzoqlashganda avtomatik ketishni qayd etish
   useEffect(() => {
     if (!activeAttendance || activeAttendance.status !== 'working' || !isAutoCheckoutEnabled) {
       setCurrentDistanceToShop(null);
+      outOfBoundsCounterRef.current = 0;
       return;
     }
 
@@ -333,7 +395,7 @@ export function WorkerPortal({
     let watchId: number | null = null;
 
     const handlePos = (pos: GeolocationPosition) => {
-      const { latitude, longitude } = pos.coords;
+      const { latitude, longitude, accuracy } = pos.coords;
       const dist = haversineDistanceMeters(
         latitude,
         longitude,
@@ -343,29 +405,50 @@ export function WorkerPortal({
       const roundedDist = Math.round(dist);
       setCurrentDistanceToShop(roundedDist);
 
-      // Agar xodim do'kondan 100m+ uzoqlashgan bo'lsa (real vaqtda)
-      if (roundedDist > autoCheckoutDistanceLimit && !autoCheckoutTriggeredRef.current) {
-        autoCheckoutTriggeredRef.current = true;
-        triggerHaptic('warning');
+      // 1. Agar xodim smenani endigina (15 daqiqadan kam vaqt oldin) boshlagan bo'lsa, avtomatik ketish qat'iyan bloklanadi!
+      const currentWorked = getAccurateAttendanceMinutes(activeAttendance);
+      if (currentWorked < 15) {
+        outOfBoundsCounterRef.current = 0;
+        return;
+      }
 
-        const now = new Date();
-        const outDateStr = getLocalDateString(now);
-        const outTimeStr = getTashkentTimeString(now, true);
+      // 2. Agar GPS aniqligi past bo'lsa (bino ichida xatolik > 75 metr), bu o'lchovni hisobga olmaymiz
+      if (accuracy && accuracy > 75) {
+        return;
+      }
 
-        const workedMinutes = calculateShiftWorkedMinutes(
-          activeAttendance.date,
-          activeAttendance.check_in_time,
-          outDateStr,
-          outTimeStr,
-          activeAttendance.total_break_minutes
-        );
+      // 3. Masofa chegarasi: do'kon radiusi + 100m xavfsizlik buferi (kamida 200 metr)
+      const safeThreshold = Math.max(autoCheckoutDistanceLimit + 100, 200);
 
-        const reason = `Do'kondan ${roundedDist} metr uzoqlashgani sababli tizim avtomatik ketishni qayd etdi`;
-        onCheckOut(workedMinutes, outDateStr, outTimeStr, reason);
+      if (roundedDist > safeThreshold) {
+        outOfBoundsCounterRef.current += 1;
+        // Kamida 3 marta ketma-ket uzoqlashganlik tasdiqlangandagina avtomatik ketish qayd etiladi
+        if (outOfBoundsCounterRef.current >= 3 && !autoCheckoutTriggeredRef.current) {
+          autoCheckoutTriggeredRef.current = true;
+          triggerHaptic('warning');
 
-        setAutoCheckoutNotice(
-          `📍 Diqqat: Do'kondan ${roundedDist} metr uzoqlashdingiz. Tizim soat ${outTimeStr.slice(0, 5)} da smenani avtomatik yakunladi va Telegram guruhiga xabar yubordi.`
-        );
+          const now = new Date();
+          const outDateStr = getLocalDateString(now);
+          const outTimeStr = getTashkentTimeString(now, true);
+
+          const workedMinutes = calculateShiftWorkedMinutes(
+            activeAttendance.date,
+            activeAttendance.check_in_time,
+            outDateStr,
+            outTimeStr,
+            activeAttendance.total_break_minutes
+          );
+
+          const reason = `Do'kondan ${roundedDist} metr uzoqlashgani sababli tizim avtomatik ketishni qayd etdi`;
+          onCheckOut(workedMinutes, outDateStr, outTimeStr, reason);
+
+          setAutoCheckoutNotice(
+            `📍 Diqqat: Do'kondan ${roundedDist} metr uzoqlashdingiz. Tizim soat ${outTimeStr.slice(0, 5)} da smenani avtomatik yakunladi va Telegram guruhiga xabar yubordi.`
+          );
+        }
+      } else {
+        // Xodim yana do'kon ichida
+        outOfBoundsCounterRef.current = 0;
       }
     };
 
@@ -791,13 +874,30 @@ export function WorkerPortal({
                 {liveStopwatch}
               </span>
             </div>
-            <div className="flex items-center justify-between text-[11px] text-slate-600 pt-1.5 border-t border-emerald-100">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-[11px] text-slate-600 pt-1.5 border-t border-emerald-100">
               <span>Kelgan vaqt: <b>{activeAttendance.check_in_time}</b></span>
               {isFirstShiftToday ? (
                 lateMinutes > 0 ? (
-                  <span className="text-amber-800 font-bold bg-amber-100/80 px-1.5 py-0.5 rounded-md">
-                    ⚠️ {lateMinutes} daq kechikkan
-                  </span>
+                  (() => {
+                    const livePen = calculateLatePenaltyAmount(
+                      activeAttendance.check_in_time,
+                      user.work_start_time || '08:00',
+                      1,
+                      settings
+                    );
+                    return (
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <span className="text-amber-800 font-bold bg-amber-100/80 px-1.5 py-0.5 rounded-md">
+                          ⚠️ {lateMinutes} daq kechikkan
+                        </span>
+                        {settings.late_penalty_enabled !== false && livePen.penaltyAmount > 0 && (
+                          <span className="text-rose-800 font-bold bg-rose-100 px-1.5 py-0.5 rounded-md border border-rose-200">
+                            Jarima: -{formatUzSum(livePen.penaltyAmount)}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })()
                 ) : (
                   <span className="text-emerald-800 font-bold bg-emerald-100/80 px-1.5 py-0.5 rounded-md">
                     ✓ Rejada kelingan
@@ -1007,6 +1107,111 @@ export function WorkerPortal({
         </div>
       </div>
 
+      {/* ⚠️ MAXSUS ALOHIDA BO'LIM: KECHIKISH VA JARIMALAR (Faqat xodimning o'ziga va Adminga ko'rinadi) */}
+      {settings.late_penalty_enabled !== false && (
+        <div className="bg-white rounded-3xl p-5 sm:p-6 border border-rose-200/80 shadow-sm space-y-3.5 text-left relative overflow-hidden">
+          <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-amber-400 via-rose-500 to-rose-600" />
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-10 h-10 rounded-2xl bg-rose-50 border border-rose-200 text-rose-600 flex items-center justify-center font-bold shrink-0 text-base">
+                ⚠️
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <h3 className="font-black text-slate-900 text-sm sm:text-base">
+                    Kechikish va Jarimalarim
+                  </h3>
+                  <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
+                    🔒 Shaxsiy
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Ruxsat: <b>{settings.late_grace_period_minutes ?? 10} daqiqa</b> · Undan oshgan har 1 daqiqa = <b>{(settings.late_penalty_per_minute_sum ?? 1000).toLocaleString()} so'm</b>
+                </p>
+              </div>
+            </div>
+            <div className="text-right shrink-0">
+              <div
+                className={`text-base sm:text-lg font-black font-mono ${
+                  monthlyLatePenaltySummary.totalPenaltySum > 0
+                    ? 'text-rose-600'
+                    : 'text-emerald-600'
+                }`}
+              >
+                {monthlyLatePenaltySummary.totalPenaltySum > 0
+                  ? `-${formatUzSum(monthlyLatePenaltySummary.totalPenaltySum)}`
+                  : "0 so'm"}
+              </div>
+              <div className="text-[10px] text-slate-400 font-semibold">
+                Shu oy ({monthlyLatePenaltySummary.totalChargeableMins} daq jarima)
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 text-center bg-slate-50 p-2.5 rounded-2xl border border-slate-100 text-xs">
+            <div>
+              <div className="text-[10px] text-slate-400 font-semibold">Ish boshlanishi</div>
+              <div className="font-black text-slate-800 mt-0.5">{user.work_start_time || '08:00'}</div>
+            </div>
+            <div className="border-x border-slate-200/70">
+              <div className="text-[10px] text-slate-400 font-semibold">Kechikkan kunlar</div>
+              <div className="font-black text-amber-700 mt-0.5">
+                {monthlyLatePenaltySummary.lateItems.length} kun
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] text-slate-400 font-semibold">Jami kechikish</div>
+              <div className="font-black text-rose-700 mt-0.5">
+                {monthlyLatePenaltySummary.totalLateMins} daq
+              </div>
+            </div>
+          </div>
+
+          {monthlyLatePenaltySummary.lateItems.length === 0 ? (
+            <div className="p-3 bg-emerald-50 rounded-2xl border border-emerald-100 text-xs text-emerald-800 font-semibold flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>Ushbu oyda kechikish va jarimalaringiz yo'q. Barakalla, o'z vaqtida kelyapsiz!</span>
+            </div>
+          ) : (
+            <div className="space-y-2 pt-1">
+              <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                Shu oydagi kechikishlar tafsiloti:
+              </div>
+              {monthlyLatePenaltySummary.lateItems.slice(0, 8).map((item, idx) => (
+                <div
+                  key={`${item.date}-${idx}`}
+                  className="flex items-center justify-between gap-2 p-3 bg-rose-50/50 rounded-xl border border-rose-100 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                      <span>{formatUzDate(item.date)}</span>
+                      {item.isActive && (
+                        <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-amber-100 text-amber-800">
+                          Hozir ishda
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-slate-600 mt-0.5">
+                      Kelgan: <b className="text-rose-700">{item.checkInTime.slice(0, 5)}</b> · Kechikish: <b>{item.lateMinutes} daq</b>
+                      {item.chargeableMinutes > 0
+                        ? ` (${item.chargeableMinutes} daq jarima)`
+                        : ` (${settings.late_grace_period_minutes ?? 10} daq ruxsat ichida)`}
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0 font-black font-mono">
+                    {item.penaltyAmount > 0 ? (
+                      <span className="text-rose-700">-{formatUzSum(item.penaltyAmount)}</span>
+                    ) : (
+                      <span className="text-emerald-700">0 so'm</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* 🧾 SUPERMARKET SMENA KVITANSIYASI (Bugungi tugallangan smenalar cheki) */}
       {todayCompletedShifts.length > 0 && (
         <div className="bg-white rounded-3xl p-5 border border-slate-200 shadow-sm relative overflow-hidden text-left">
@@ -1030,43 +1235,56 @@ export function WorkerPortal({
 
           {/* Smenalar ro'yxati (1-smena, 2-smena va hokazo) */}
           <div className="space-y-2">
-            {todayCompletedShifts.map((shift, idx) => {
-              const shiftMins = getAccurateAttendanceMinutes(shift);
-              return (
-                <div
-                  key={shift.id}
-                  className="flex items-center justify-between p-3 bg-slate-50/90 rounded-xl border border-slate-100 text-xs"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <span className="w-6 h-6 rounded-lg bg-emerald-100 text-emerald-900 text-xs font-black flex items-center justify-center shrink-0">
-                      {idx + 1}
-                    </span>
-                    <div>
-                      <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
-                        <span>{idx + 1}-smena:</span>
-                        <span className="text-emerald-700">🟢 {shift.check_in_time.slice(0, 5)}</span>
-                        <span>➡️</span>
-                        <span className="text-rose-700">🔴 {shift.check_out_time ? shift.check_out_time.slice(0, 5) : '---'}</span>
+            {[...todayCompletedShifts]
+              .sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''))
+              .map((shift, idx) => {
+                const shiftMins = getAccurateAttendanceMinutes(shift);
+                const shiftPen = calculateLatePenaltyAmount(
+                  shift.check_in_time,
+                  user.work_start_time || '08:00',
+                  idx + 1,
+                  settings
+                );
+                return (
+                  <div
+                    key={shift.id}
+                    className="flex items-center justify-between p-3 bg-slate-50/90 rounded-xl border border-slate-100 text-xs"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <span className="w-6 h-6 rounded-lg bg-emerald-100 text-emerald-900 text-xs font-black flex items-center justify-center shrink-0">
+                        {idx + 1}
+                      </span>
+                      <div>
+                        <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                          <span>{idx + 1}-smena:</span>
+                          <span className="text-emerald-700">🟢 {shift.check_in_time.slice(0, 5)}</span>
+                          <span>➡️</span>
+                          <span className="text-rose-700">🔴 {shift.check_out_time ? shift.check_out_time.slice(0, 5) : '---'}</span>
+                          {idx === 0 && settings.late_penalty_enabled !== false && shiftPen.penaltyAmount > 0 && (
+                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">
+                              Jarima: -{formatUzSum(shiftPen.penaltyAmount)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          {shift.check_out_date && shift.check_out_date !== shift.date
+                            ? 'Tungi smena (00:00 dan keyin yakunlangan)'
+                            : "Kunning o'zida yakunlangan smena"}
+                          {shift.total_break_minutes ? ` · Tanaffus: ${shift.total_break_minutes} daq` : ''}
+                        </div>
                       </div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">
-                        {shift.check_out_date && shift.check_out_date !== shift.date
-                          ? 'Tungi smena (00:00 dan keyin yakunlangan)'
-                          : 'Kunning o\'zida yakunlangan smena'}
-                        {shift.total_break_minutes ? ` · Tanaffus: ${shift.total_break_minutes} daq` : ''}
+                    </div>
+                    <div className="text-right shrink-0">
+                      <div className="font-black text-[#008f45] text-sm font-mono">
+                        {formatMinutesToHours(shiftMins)}
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-medium">
+                        ({(shiftMins / 60).toFixed(1)} soat)
                       </div>
                     </div>
                   </div>
-                  <div className="text-right shrink-0">
-                    <div className="font-black text-[#008f45] text-sm font-mono">
-                      {formatMinutesToHours(shiftMins)}
-                    </div>
-                    <div className="text-[10px] text-slate-400 font-medium">
-                      ({(shiftMins / 60).toFixed(1)} soat)
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
           </div>
 
           {/* Chek yakuniy jami (Grand Total) */}

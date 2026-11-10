@@ -10,6 +10,7 @@ import {
   formatUzSum,
   getLocalMonthString,
   getLocalDateString,
+  calculateLatePenaltyAmount,
 } from '../utils/calculations';
 import { triggerHaptic } from '../utils/telegram';
 import { isUserAuthorizedForPayroll } from '../utils/adminAuth';
@@ -259,9 +260,10 @@ export function PayrollManager({
       attendances,
       activePeriod.startDate,
       activePeriod.endDate,
-      false
+      false,
+      settings
     );
-  }, [workers, attendances, activePeriod]);
+  }, [workers, attendances, activePeriod, settings]);
 
   // Avanslar, mukofot va jarimalar ro'yxati
   const adjustments = useMemo(() => {
@@ -308,9 +310,36 @@ export function PayrollManager({
         .filter((a) => a.type === 'bonus')
         .reduce((sum, a) => sum + a.amount, 0);
 
-      const penalties = workerPeriodAdjustments
+      const manualPenalties = workerPeriodAdjustments
         .filter((a) => a.type === 'penalty')
         .reduce((sum, a) => sum + a.amount, 0);
+
+      // Kechikish jarimalari (sana oralig'i bo'yicha)
+      let workerLatePenaltySum = 0;
+      let workerLateMinutesTotal = 0;
+      const userAtts = attendances.filter(
+        (a) =>
+          a.user_id === worker.id &&
+          a.date >= activePeriod.startDate &&
+          a.date <= activePeriod.endDate
+      );
+      const dateMap = new Map<string, Attendance[]>();
+      userAtts.forEach((a) => {
+        const list = dateMap.get(a.date) || [];
+        list.push(a);
+        dateMap.set(a.date, list);
+      });
+      dateMap.forEach((shifts) => {
+        shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+        const firstShift = shifts[0];
+        if (firstShift && firstShift.check_in_time) {
+          const res = calculateLatePenaltyAmount(firstShift.check_in_time, worker.work_start_time || '08:00', 1, settings);
+          workerLateMinutesTotal += res.lateMinutes;
+          workerLatePenaltySum += res.penaltyAmount;
+        }
+      });
+
+      const penalties = manualPenalties + workerLatePenaltySum;
 
       // Qo'lga tegishi kerak bo'lgan sof oylik
       const netPayable = Math.max(0, grossSalary + bonuses - advances - penalties);
@@ -348,6 +377,9 @@ export function PayrollManager({
         advances,
         bonuses,
         penalties,
+        manualPenalties,
+        latePenaltySum: workerLatePenaltySum,
+        lateMinutesTotal: workerLateMinutesTotal,
         netPayable,
         isPaid,
         adjustments: workerPeriodAdjustments,
@@ -356,13 +388,13 @@ export function PayrollManager({
     });
   }, [
     workers,
+    attendances,
     periodHoursList,
     adjustments,
     activePeriod,
     selectedMonth,
     defaultHourlyRate,
-    settings.payroll_payout_status,
-    settings.payroll_payout_records,
+    settings,
   ]);
 
   // Qidiruv va filtr bo'yicha saralash
@@ -1321,6 +1353,7 @@ export function PayrollManager({
                 <th className="py-3.5 px-4">Stavka</th>
                 <th className="py-3.5 px-4">Asosiy Oylik</th>
                 <th className="py-3.5 px-4">Avans (-)</th>
+                <th className="py-3.5 px-4 text-rose-700">Jarima (-)</th>
                 <th className="py-3.5 px-4">Mukofot (+)</th>
                 <th className="py-3.5 px-4 text-emerald-700">Sof To'lov</th>
                 <th className="py-3.5 px-4">Holat</th>
@@ -1330,7 +1363,7 @@ export function PayrollManager({
             <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
               {filteredPayrollItems.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-8 text-center text-slate-400">
+                  <td colSpan={11} className="py-8 text-center text-slate-400">
                     Xodimlar topilmadi
                   </td>
                 </tr>
@@ -1371,6 +1404,22 @@ export function PayrollManager({
                         <span className="font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md">
                           -{formatUzSum(item.advances)}
                         </span>
+                      ) : (
+                        <span className="text-slate-300">—</span>
+                      )}
+                    </td>
+                    <td className="py-3.5 px-4">
+                      {item.penalties > 0 ? (
+                        <div className="space-y-0.5">
+                          <span className="font-bold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-md inline-block border border-rose-200">
+                            -{formatUzSum(item.penalties)}
+                          </span>
+                          {item.latePenaltySum > 0 && (
+                            <div className="text-[10px] text-rose-600 font-medium">
+                              Kechikish: -{formatUzSum(item.latePenaltySum)} ({item.lateMinutesTotal}m)
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <span className="text-slate-300">—</span>
                       )}
@@ -1498,11 +1547,17 @@ export function PayrollManager({
                     <span className="font-bold text-slate-700">{formatUzSum(item.grossSalary)}</span>
                   </div>
                   <div>
-                    <span className="text-slate-400 block text-[10px] uppercase font-bold">Avans / Mukofot</span>
-                    <span className="font-semibold text-amber-800">
-                      {item.advances > 0 ? `-${formatUzSum(item.advances)}` : '0'}
+                    <span className="text-slate-400 block text-[10px] uppercase font-bold">Avans / Jarima / Mukofot</span>
+                    <span className="font-semibold text-amber-800 block">
+                      {item.advances > 0 ? `Avans: -${formatUzSum(item.advances)}` : 'Avans: 0'}
                     </span>
-                    {item.bonuses > 0 && <span className="text-emerald-600 block text-[11px]">+{formatUzSum(item.bonuses)}</span>}
+                    {item.penalties > 0 && (
+                      <span className="text-rose-700 font-bold block text-[11px]">
+                        Jarima: -{formatUzSum(item.penalties)}
+                        {item.latePenaltySum > 0 ? ` (kechikish: ${item.lateMinutesTotal}m)` : ''}
+                      </span>
+                    )}
+                    {item.bonuses > 0 && <span className="text-emerald-600 font-semibold block text-[11px]">Mukofot: +{formatUzSum(item.bonuses)}</span>}
                   </div>
                 </div>
 

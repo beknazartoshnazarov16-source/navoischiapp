@@ -278,6 +278,76 @@ export function RemindersManager({
     }
   };
 
+  // Har bir xodimga alohida shaxsiy uyg'otuvchi / chaqiruvchi Telegram eslatma yuborish
+  const handleSendWakeupToWorker = async (w: User) => {
+    if (!settings.bot_token) {
+      showStatus('error', "Sozlamalarda Bot Token kiritilmagan!");
+      return;
+    }
+    if (!w.telegram_id) {
+      showStatus('error', `«${w.full_name}» hali Telegram botdan ro'yxatdan o'tmagan.`);
+      return;
+    }
+
+    setIsSending(true);
+    const minutesBefore = settings.reminder_morning_wakeup_minutes_before || 30;
+    const customLine = settings.reminder_morning_wakeup_custom_text
+      ? `\n💬 <i>${settings.reminder_morning_wakeup_custom_text}</i>\n`
+      : '';
+    const text =
+      `🌅 <b>XAYRLI TONG, ${w.full_name}!</b>\n\n` +
+      `⏰ <b>Smena boshlanishiga taxminan ${minutesBefore} daqiqa qoldi!</b>\n` +
+      `🏢 <b>Ish vaqtingiz:</b> <b>${w.work_start_time || '08:00'}</b> — ${w.work_end_time || '20:00'}\n` +
+      `📍 <b>Manzil:</b> ${settings.shop_name || 'Navo Market'}\n` +
+      customLine +
+      `\nDo'konga yetib kelgach, botga kirib darhol <b>«📍 ISHGA KELDIM»</b> tugmasini bosishni unutmang!`;
+
+    const res = await sendTelegramNotification(settings.bot_token, String(w.telegram_id), text);
+    setIsSending(false);
+
+    if (res.success) {
+      showStatus('success', `«${w.full_name}» ga shaxsiy uyg'otuvchi eslatma yuborildi!`);
+    } else {
+      showStatus('error', res.error || "Xabar yuborilmadi.");
+    }
+  };
+
+  // Barcha kelmagan xodimlarning shaxsiy Telegramiga birvarakay uyg'otuvchi xabar yuborish
+  const handleSendAllWakeupReminders = async () => {
+    const reachable = notCheckedInWorkers.filter((w) => Boolean(w.telegram_id));
+    if (reachable.length === 0) {
+      showStatus('error', "Kelmagan xodimlar orasida Telegram ID si ulanganlari topilmadi.");
+      return;
+    }
+    if (!settings.bot_token) {
+      showStatus('error', "Sozlamalarda Bot Token kiritilmagan!");
+      return;
+    }
+
+    setIsSending(true);
+    let sentCount = 0;
+    const minutesBefore = settings.reminder_morning_wakeup_minutes_before || 30;
+
+    for (const w of reachable) {
+      const customLine = settings.reminder_morning_wakeup_custom_text
+        ? `\n💬 <i>${settings.reminder_morning_wakeup_custom_text}</i>\n`
+        : '';
+      const text =
+        `🌅 <b>XAYRLI TONG, ${w.full_name}!</b>\n\n` +
+        `⏰ <b>Smena boshlanishiga ${minutesBefore} daqiqa qoldi!</b>\n` +
+        `🏢 <b>Ish vaqtingiz:</b> <b>${w.work_start_time || '08:00'}</b> — ${w.work_end_time || '20:00'}\n` +
+        `📍 <b>Manzil:</b> ${settings.shop_name || 'Navo Market'}\n` +
+        customLine +
+        `\nDo'konga yetib kelgach, botga kirib darhol <b>«📍 ISHGA KELDIM»</b> tugmasini bosishni unutmang!`;
+
+      const res = await sendTelegramNotification(settings.bot_token, String(w.telegram_id), text);
+      if (res.success) sentCount++;
+    }
+
+    setIsSending(false);
+    showStatus('success', `${sentCount} nafar xodimga shaxsiy Telegram uyg'otuvchi eslatma yuborildi!`);
+  };
+
   // Rahbariyat e'lonini saqlash
   const handleSaveAnnouncement = (e: React.FormEvent) => {
     e.preventDefault();
@@ -707,17 +777,58 @@ export function RemindersManager({
       )}
 
       {/* ======================================================== */}
-      {/* 2. BUGUN KELMAGANLAR BO'LIMI                               */}
+      {/* 2. BUGUN KELMAGANLAR & ERTALABKI UYG'OTUVCHI ESLATMA       */}
       {/* ======================================================== */}
       {activeTab === 'morning' && (
         <div className="bg-white rounded-3xl p-5 sm:p-6 border border-slate-200 shadow-xs space-y-4">
+          {/* ☀️ Ertalabki Avtomatik Uyg'otuvchi Tizim Status Banneri */}
+          <div className="p-4 bg-gradient-to-r from-amber-50 via-orange-50/50 to-amber-50 rounded-2xl border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs mt-0.5">
+                <Sun className="w-5 h-5 text-white animate-pulse" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs sm:text-sm font-black text-slate-900">
+                    Avtomatik Ertalabki Uyg'otuvchi & Eslatma Tizimi
+                  </span>
+                  <span
+                    className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
+                      settings.reminder_morning_wakeup_enabled !== false
+                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                        : 'bg-slate-200 text-slate-700'
+                    }`}
+                  >
+                    {settings.reminder_morning_wakeup_enabled !== false ? '24/7 Avtomat Faol' : "O'chiq"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-600 mt-0.5">
+                  Har bir xodimning smenasi boshlanishidan <b>{settings.reminder_morning_wakeup_minutes_before || 30} daqiqa oldin</b> bot orqali uning shaxsiy Telegramiga muloyim uyg'otuvchi xabar va «📍 Ishga keldim» tugmasi yuboriladi.
+                </p>
+              </div>
+            </div>
+
+            {notCheckedInWorkers.length > 0 && (
+              <button
+                type="button"
+                disabled={isSending}
+                onClick={handleSendAllWakeupReminders}
+                className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 active:scale-95 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
+                title="Barcha kelmagan xodimlarning shaxsiy Telegramiga xabar yuborish"
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>Barchaga Shaxsiy Uyg'otish ({notCheckedInWorkers.filter((w) => w.telegram_id).length})</span>
+              </button>
+            )}
+          </div>
+
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
             <div>
               <h3 className="text-sm sm:text-base font-black text-slate-900">
                 Bugun Hali Kelmagan Xodimlar ({notCheckedInWorkers.length} ta)
               </h3>
               <p className="text-xs text-slate-500 mt-0.5">
-                Ertalabki ish vaqti boshlangach, kelmagan xodimlarga do'kon guruhi orqali umumiy eslatma yuboring.
+                Xodimlarga alohida yoki umumiy do'kon guruhi orqali uyg'otuvchi eslatma yuborishingiz mumkin.
               </p>
             </div>
 
@@ -726,7 +837,7 @@ export function RemindersManager({
                 type="button"
                 disabled={isSending}
                 onClick={handleSendMorningReminder}
-                className="px-3.5 py-2 bg-gradient-to-r from-[#00a651] to-[#008f45] text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer active:scale-95"
+                className="px-3.5 py-2 bg-gradient-to-r from-[#00a651] to-[#008f45] hover:opacity-95 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer active:scale-95"
               >
                 <Sun className="w-3.5 h-3.5" />
                 <span>Guruhga Ertalabki Eslatma Yuborish</span>
@@ -762,9 +873,24 @@ export function RemindersManager({
                       </div>
                     </div>
                   </div>
-                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md shrink-0">
-                    Kelmagan
-                  </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {w.telegram_id ? (
+                      <button
+                        type="button"
+                        disabled={isSending}
+                        onClick={() => handleSendWakeupToWorker(w)}
+                        className="px-2 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-[10px] font-bold transition flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs"
+                        title="Ushbu xodimga shaxsiy Telegram eslatma yuborish"
+                      >
+                        <Sun className="w-3 h-3" />
+                        <span>Uyg'otish</span>
+                      </button>
+                    ) : (
+                      <span className="text-[9px] font-bold text-slate-400 bg-slate-200/80 px-1.5 py-0.5 rounded">
+                        Tg yo'q
+                      </span>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>

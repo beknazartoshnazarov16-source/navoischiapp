@@ -18,6 +18,11 @@ export const INITIAL_SETTINGS: MarketSettings = {
   payroll_payout_status: {},
   auto_checkout_on_distance_enabled: true,
   auto_checkout_distance_meters: 100,
+  late_penalty_enabled: true,
+  late_grace_period_minutes: 10,
+  late_penalty_per_minute_sum: 1000,
+  reminder_morning_wakeup_enabled: true,
+  reminder_morning_wakeup_minutes_before: 30,
 };
 
 // Foydalanuvchilar faqat Firestore bazasidan yuklanadi — yangi kirganlarga hech qachon Admin profili ochilib ketmasligi uchun bo'sh!

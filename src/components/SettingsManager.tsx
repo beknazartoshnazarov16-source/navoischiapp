@@ -24,6 +24,7 @@ import {
   Zap,
   Smartphone,
   Navigation,
+  Sun,
 } from 'lucide-react';
 import { formatMinutesToHours } from '../utils/calculations';
 import { sendTelegramNotification, triggerHaptic } from '../utils/telegram';
@@ -665,9 +666,175 @@ export function SettingsManager({
               </div>
             </div>
           )}
+        </div>
 
-          {/* Do'kon koordinatalari (Doimo sozlanadigan va xatolarsiz) */}
-          <div className="p-3.5 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-amber-200/80 dark:border-amber-800/80 space-y-3">
+        {/* Kechikish va Jarima Sozlamalari (Yangi) */}
+        <div className="p-4 sm:p-5 bg-gradient-to-br from-rose-50/90 via-orange-50/50 to-rose-50/90 dark:from-rose-950/40 dark:via-orange-950/20 dark:to-rose-950/40 rounded-2xl border border-rose-200 dark:border-rose-800 space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-xl bg-rose-600 text-white flex items-center justify-center shrink-0 shadow-xs mt-0.5">
+                <AlertCircle className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span>Kechikish uchun jarima tizimi</span>
+                  <span className="px-2 py-0.5 rounded-full bg-rose-100 dark:bg-rose-900/60 text-rose-900 dark:text-rose-200 text-[10px] font-extrabold">
+                    {formData.late_penalty_enabled !== false ? "Faol" : "O'chiq"}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5 leading-relaxed">
+                  Ishchilar belgilangan vaqtdan kechikib kelganda avtomatik jarima hisoblanadi. Ruxsat etilgan daqiqadan oshgan har bir daqiqa uchun belgilangan summa jarimaga yoziladi va xodim hamda adminga ko'rinib turadi.
+                </p>
+              </div>
+            </div>
+
+            <label className="relative inline-flex items-center cursor-pointer shrink-0">
+              <input
+                type="checkbox"
+                checked={formData.late_penalty_enabled !== false}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    late_penalty_enabled: e.target.checked,
+                  })
+                }
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-slate-200 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rose-600"></div>
+            </label>
+          </div>
+
+          {formData.late_penalty_enabled !== false && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 text-xs">
+              <div className="p-3 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-rose-200/80 dark:border-rose-800/80 space-y-1.5">
+                <label className="block font-bold text-slate-700 dark:text-slate-300">
+                  Ruxsat etilgan kechikish (daqiqa):
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="60"
+                  value={formData.late_grace_period_minutes !== undefined ? formData.late_grace_period_minutes : 10}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      late_grace_period_minutes: parseInt(e.target.value, 10) || 0,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg font-bold text-slate-900 dark:text-white"
+                />
+                <p className="text-[10px] text-slate-500">Shuncha daqiqagacha kechikishga jarima yozilmaydi (Standart: 10 daqiqa).</p>
+              </div>
+
+              <div className="p-3 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-rose-200/80 dark:border-rose-800/80 space-y-1.5">
+                <label className="block font-bold text-slate-700 dark:text-slate-300">
+                  1 daqiqa kechikish jarimasi (so'm):
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="500"
+                  value={formData.late_penalty_per_minute_sum !== undefined ? formData.late_penalty_per_minute_sum : 1000}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      late_penalty_per_minute_sum: parseInt(e.target.value, 10) || 0,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg font-bold text-slate-900 dark:text-white font-mono"
+                />
+                <p className="text-[10px] text-slate-500">Har bir ortiqcha daqiqa uchun summa (Standart: 1000 so'm).</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ☀️ Ertalabki uyg'otuvchi va ishga chaqiruvchi eslatma sozlamalari */}
+        <div className="p-4 sm:p-5 bg-gradient-to-br from-amber-50/90 via-emerald-50/40 to-amber-50/90 dark:from-amber-950/40 dark:via-emerald-950/20 dark:to-amber-950/40 rounded-2xl border border-amber-200 dark:border-amber-800 space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs mt-0.5">
+                <Sun className="w-4 h-4 text-white" />
+              </div>
+              <div>
+                <div className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <span>Ertalabki uyg'otuvchi & ishga chaqiruvchi Telegram eslatma</span>
+                  <span className="px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/60 text-amber-900 dark:text-amber-200 text-[10px] font-extrabold">
+                    {formData.reminder_morning_wakeup_enabled !== false ? "Faol" : "O'chiq"}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5 leading-relaxed">
+                  Har kuni ertalab xodimning smenasi boshlanishidan oldin (masalan, 30 daqiqa oldin) Telegram bot orqali uning shaxsiy chatiga muloyim uyg'otuvchi eslatma va «📍 Ishga keldim» tugmasi yuboriladi. Bu kechikishlarni keskin kamaytiradi!
+                </p>
+              </div>
+            </div>
+
+            <label className="relative inline-flex items-center cursor-pointer shrink-0">
+              <input
+                type="checkbox"
+                checked={formData.reminder_morning_wakeup_enabled !== false}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    reminder_morning_wakeup_enabled: e.target.checked,
+                  })
+                }
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-slate-200 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500"></div>
+            </label>
+          </div>
+
+          {formData.reminder_morning_wakeup_enabled !== false && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 text-xs">
+              <div className="p-3 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-amber-200/80 dark:border-amber-800/80 space-y-1.5">
+                <label className="block font-bold text-slate-700 dark:text-slate-300">
+                  Smena boshlanishidan necha daqiqa oldin yuborilsin?
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min="5"
+                    max="180"
+                    step="5"
+                    value={formData.reminder_morning_wakeup_minutes_before !== undefined ? formData.reminder_morning_wakeup_minutes_before : 30}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        reminder_morning_wakeup_minutes_before: parseInt(e.target.value, 10) || 30,
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg font-bold text-slate-900 dark:text-white font-mono"
+                  />
+                  <span className="font-bold text-slate-600 dark:text-slate-300 shrink-0">daqiqa</span>
+                </div>
+                <p className="text-[10px] text-slate-500">Standart: 30 daqiqa oldin (08:00 dagi ishchi uchun 07:30 da boradi).</p>
+              </div>
+
+              <div className="p-3 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-amber-200/80 dark:border-amber-800/80 space-y-1.5">
+                <label className="block font-bold text-slate-700 dark:text-slate-300">
+                  Qo'shimcha dil so'zlari yoki motivatsiya:
+                </label>
+                <input
+                  type="text"
+                  placeholder="Masalan: Bugun kuningiz barakali va sermahsul o'tsin!"
+                  value={formData.reminder_morning_wakeup_custom_text || ''}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      reminder_morning_wakeup_custom_text: e.target.value,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                />
+                <p className="text-[10px] text-slate-500">Xabar ichida ko'rinadi (ixtiyoriy).</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Do'kon koordinatalari (Doimo sozlanadigan va xatolarsiz) */}
+        <div className="p-3.5 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-amber-200/80 dark:border-amber-800/80 space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
                 <MapPin className="w-4 h-4 text-amber-600" />
@@ -715,9 +882,8 @@ export function SettingsManager({
               </div>
             </div>
           </div>
-        </div>
 
-        {/* Telegram Bot Integratsiyasi & Jonli Xabarnomalar */}
+          {/* Telegram Bot Integratsiyasi & Jonli Xabarnomalar */}
         <div className="p-5 bg-gradient-to-br from-sky-50/80 to-indigo-50/50 rounded-2xl border border-sky-200 space-y-4">
           <div className="flex items-start justify-between gap-3 flex-wrap">
             <div className="flex items-center gap-2.5">

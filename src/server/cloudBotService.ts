@@ -26,6 +26,8 @@ import {
   formatMinutesToHours as formatMinutes,
   calculateLateMinutes,
   haversineDistanceMeters,
+  calculateLatePenaltyAmount,
+  formatUzSum,
 } from '../utils/calculations.ts';
 
 // O'zbekiston (Toshkent UTC+5, yozgi vaqt o'zgarishi yo'q) uchun 100% aniq vaqt qismlari
@@ -121,8 +123,9 @@ export class CloudTelegramBot {
   private pollAbortController: AbortController | null = null;
   private consecutiveErrors = 0;
   private instanceId = `srv_${process.pid}_${Math.random().toString(36).substring(2, 8)}`;
-  // Production server (4) > Dev server (3) > Eski versiya (0)
-  private leaderPriority = process.env.NODE_ENV === 'production' ? 4 : 3;
+  private bootTime = Date.now();
+  // Yangilangan barqaror versiya (500) har qanday eski qolib ketgan serverlardan ustun keladi va pollingni darhol oladi
+  private leaderPriority = 500;
   private isLeader = false;
   private lastLeaderCheck = 0;
   private observedLeaderId: string | null = null;
@@ -147,6 +150,14 @@ export class CloudTelegramBot {
   private marketLatitude = 38.829651;
   private marketLongitude = 65.810833;
   private gpsRadiusMeters = 100;
+  // Kechikish va jarima sozlamalari (Firestore dan jonli sinxronlanadi)
+  private latePenaltyEnabled = true;
+  private lateGracePeriodMinutes = 10;
+  private latePenaltyPerMinuteSum = 1000;
+  // Ertalabki uyg'otuvchi va ishga chaqiruvchi eslatma sozlamalari
+  private morningWakeupEnabled = true;
+  private morningWakeupMinutesBefore = 30;
+  private morningWakeupCustomText = '';
   private pendingLocationUsers = new Map<string, { chatId: number; isAdm: boolean; isGroup: boolean; timestamp: number }>();
   private pendingCheckoutLocationUsers = new Map<string, { chatId: number; isAdm: boolean; isGroup: boolean; timestamp: number }>();
   private pendingDateRangeUsers = new Set<string>();
@@ -156,12 +167,21 @@ export class CloudTelegramBot {
     this.listenToSettings();
   }
 
+  private getPenaltySettings(): Partial<MarketSettings> {
+    return {
+      late_penalty_enabled: this.latePenaltyEnabled,
+      late_grace_period_minutes: this.lateGracePeriodMinutes,
+      late_penalty_per_minute_sum: this.latePenaltyPerMinuteSum,
+    };
+  }
+
   public getStatus() {
     const tParts = getTashkentParts();
     return {
       running: this.isRunning,
       isLeader: this.isLeader,
       leaderPriority: this.leaderPriority,
+      bootTime: this.bootTime,
       observedLeaderId: this.observedLeaderId || (this.isLeader ? this.instanceId : null),
       isWebhookMode: this.isWebhookMode,
       webhookUrl: this.webhookUrl,
@@ -175,6 +195,11 @@ export class CloudTelegramBot {
       notifyTargetCount: this.notifyTargetIds.length,
       notifyTargets: this.notifyTargetIds,
       shopName: this.shopName,
+      latePenaltyEnabled: this.latePenaltyEnabled,
+      lateGracePeriodMinutes: this.lateGracePeriodMinutes,
+      latePenaltyPerMinuteSum: this.latePenaltyPerMinuteSum,
+      morningWakeupEnabled: this.morningWakeupEnabled,
+      morningWakeupMinutesBefore: this.morningWakeupMinutesBefore,
       consecutiveErrors: this.consecutiveErrors,
       tashkentTime: `${tParts.dateStr} ${tParts.timeStr}`,
       timestamp: getTashkentNow().toISOString(),
@@ -315,120 +340,118 @@ export class CloudTelegramBot {
     }
   }
 
+  private applySettingsData(data: Partial<MarketSettings>): { tokenChanged: boolean } {
+    const newToken = (data.bot_token || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+    const newAdmin = (data.admin_telegram_id || '').trim();
+    const newGroup = (data.group_telegram_id || '').trim();
+    const payrollAdmin = (data.payroll_admin_id || '').trim();
+    this.shopName = data.shop_name || 'Navo Market';
+
+    const adminsList = newAdmin
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('-'));
+
+    const adminIdsArray = Array.isArray(data.admin_ids) ? data.admin_ids.map(String) : [];
+    const adminsArray = Array.isArray(data.admins) ? data.admins.map((a: any) => String(a.telegram_id || '')) : [];
+    const combinedAdminList = [
+      ...adminsList,
+      ...adminIdsArray,
+      ...adminsArray,
+      ...(payrollAdmin && !payrollAdmin.startsWith('-') ? [payrollAdmin] : []),
+    ]
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('-') && s !== '123456789');
+
+    const allTargets = [
+      ...combinedAdminList,
+      ...newGroup.split(/[,;\s]+/),
+    ]
+      .map((s) => s.trim())
+      .filter((s) => Boolean(s) && s !== '123456789');
+
+    const tokenChanged = Boolean(this.botToken && newToken && newToken !== this.botToken) || (!this.botToken && Boolean(newToken));
+    this.botToken = newToken;
+    this.adminIds = Array.from(new Set(combinedAdminList));
+    this.notifyTargetIds = Array.from(new Set(allTargets));
+
+    // GPS sozlamalari
+    this.gpsRequired = data.gps_required !== false;
+    this.gpsCheckoutRequired = Boolean(data.gps_checkout_required);
+    if (typeof data.market_latitude === 'number' && !isNaN(data.market_latitude)) {
+      this.marketLatitude = data.market_latitude;
+    }
+    if (typeof data.market_longitude === 'number' && !isNaN(data.market_longitude)) {
+      this.marketLongitude = data.market_longitude;
+    }
+    if (typeof data.gps_radius_meters === 'number' && !isNaN(data.gps_radius_meters)) {
+      this.gpsRadiusMeters = data.gps_radius_meters;
+    }
+
+    // Kechikish jarimasi sozlamalarini jonli yangilash
+    this.latePenaltyEnabled = data.late_penalty_enabled !== false;
+    this.lateGracePeriodMinutes =
+      typeof data.late_grace_period_minutes === 'number' && !isNaN(data.late_grace_period_minutes)
+        ? Math.max(0, data.late_grace_period_minutes)
+        : 10;
+    this.latePenaltyPerMinuteSum =
+      typeof data.late_penalty_per_minute_sum === 'number' && !isNaN(data.late_penalty_per_minute_sum)
+        ? Math.max(0, data.late_penalty_per_minute_sum)
+        : 1000;
+
+    // Ertalabki uyg'otuvchi va ishga chaqiruvchi eslatma sozlamalari
+    this.morningWakeupEnabled = data.reminder_morning_wakeup_enabled !== false;
+    this.morningWakeupMinutesBefore =
+      typeof data.reminder_morning_wakeup_minutes_before === 'number' && !isNaN(data.reminder_morning_wakeup_minutes_before)
+        ? Math.max(5, Math.min(180, data.reminder_morning_wakeup_minutes_before))
+        : 30;
+    this.morningWakeupCustomText = String(data.reminder_morning_wakeup_custom_text || '').trim();
+
+    return { tokenChanged };
+  }
+
   // Firestore sozlamalarini jonli tinglash va boshlang'ich yuklash
   private listenToSettings() {
     const settingsDoc = doc(db, 'settings', 'general_settings');
-    
+
     // Boshlang'ich qiymatni darhol o'qish
-    getDoc(settingsDoc).then(async (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.data() as Partial<MarketSettings>;
-        const newToken = (data.bot_token || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
-        const newAdmin = (data.admin_telegram_id || '').trim();
-        const newGroup = (data.group_telegram_id || '').trim();
-        this.shopName = data.shop_name || 'Navo Market';
-
-        const adminsList = newAdmin
-          .split(/[,;\s]+/)
-          .map((s) => s.trim())
-          .filter((s) => s && !s.startsWith('-'));
-
-        const adminIdsArray = Array.isArray(data.admin_ids) ? data.admin_ids.map(String) : [];
-        const adminsArray = Array.isArray(data.admins) ? data.admins.map((a: any) => String(a.telegram_id || '')) : [];
-        const combinedAdminList = [...adminsList, ...adminIdsArray, ...adminsArray]
-          .map((s) => s.trim())
-          .filter((s) => s && !s.startsWith('-'));
-
-        const allTargets = [
-          ...combinedAdminList,
-          ...newGroup.split(/[,;\s]+/),
-        ]
-          .map((s) => s.trim())
-          .filter(Boolean);
-
-        this.botToken = newToken;
-        this.adminIds = Array.from(new Set(combinedAdminList));
-        this.notifyTargetIds = Array.from(new Set(allTargets));
-
-        this.gpsRequired = data.gps_required !== false;
-        this.gpsCheckoutRequired = Boolean(data.gps_checkout_required);
-        if (typeof data.market_latitude === 'number' && !isNaN(data.market_latitude)) {
-          this.marketLatitude = data.market_latitude;
+    getDoc(settingsDoc)
+      .then(async (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data() as Partial<MarketSettings>;
+          this.applySettingsData(data);
+          console.log(
+            `[CloudBot] Boshlang'ich sozlamalar yuklandi: Token=${Boolean(this.botToken)}, Adminlar=${this.adminIds.join(',')}, Jarima=${this.latePenaltyEnabled} (${this.lateGracePeriodMinutes}m / ${this.latePenaltyPerMinuteSum} so'm)`
+          );
+          if (this.botToken) {
+            await this.clearWebhook();
+          }
+        } else if (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN) {
+          this.botToken = (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+          console.log(`[CloudBot] Environment'dan bot token yuklandi.`);
+          if (this.botToken) {
+            await this.clearWebhook();
+          }
         }
-        if (typeof data.market_longitude === 'number' && !isNaN(data.market_longitude)) {
-          this.marketLongitude = data.market_longitude;
-        }
-        if (typeof data.gps_radius_meters === 'number' && !isNaN(data.gps_radius_meters)) {
-          this.gpsRadiusMeters = data.gps_radius_meters;
-        }
-
-        console.log(`[CloudBot] Boshlang'ich sozlamalar yuklandi: Token bor=${Boolean(this.botToken)}, Adminlar=${this.adminIds.join(',')}`);
-        if (this.botToken) {
-          await this.clearWebhook();
-        }
-      } else if (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN) {
-        this.botToken = (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
-        console.log(`[CloudBot] Environment'dan bot token yuklandi.`);
-        if (this.botToken) {
-          await this.clearWebhook();
-        }
-      }
-    }).catch((err) => {
-      console.warn('[CloudBot] Boshlang\'ich sozlamalarni o\'qishda ogohlantirish:', err);
-    });
+      })
+      .catch((err) => {
+        console.warn("[CloudBot] Boshlang'ich sozlamalarni o'qishda ogohlantirish:", err);
+      });
 
     onSnapshot(
       settingsDoc,
       (snapshot) => {
         if (snapshot.exists()) {
           const data = snapshot.data() as Partial<MarketSettings>;
-          const newToken = (data.bot_token || process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
-          const newAdmin = (data.admin_telegram_id || '').trim();
-          const newGroup = (data.group_telegram_id || '').trim();
-          this.shopName = data.shop_name || 'Navo Market';
+          const { tokenChanged } = this.applySettingsData(data);
 
-          // Shaxsiy admin ID lari (faqat musbat sonlar)
-          const adminsList = newAdmin
-            .split(/[,;\s]+/)
-            .map((s) => s.trim())
-            .filter((s) => s && !s.startsWith('-'));
-
-          const adminIdsArray = Array.isArray(data.admin_ids) ? data.admin_ids.map(String) : [];
-          const adminsArray = Array.isArray(data.admins) ? data.admins.map((a: any) => String(a.telegram_id || '')) : [];
-          const combinedAdminList = [...adminsList, ...adminIdsArray, ...adminsArray]
-            .map((s) => s.trim())
-            .filter((s) => s && !s.startsWith('-'));
-
-          // Xabarnoma yuboriladigan barcha ID lar (shaxsiy adminlar + guruhlar)
-          const allTargets = [
-            ...combinedAdminList,
-            ...newGroup.split(/[,;\s]+/),
-          ]
-            .map((s) => s.trim())
-            .filter(Boolean);
-
-          const tokenChanged = newToken !== this.botToken;
-          this.botToken = newToken;
-          this.adminIds = Array.from(new Set(combinedAdminList));
-          this.notifyTargetIds = Array.from(new Set(allTargets));
-
-          // GPS sozlamalarini yangilash
-          this.gpsRequired = data.gps_required !== false;
-          this.gpsCheckoutRequired = Boolean(data.gps_checkout_required);
-          if (typeof data.market_latitude === 'number' && !isNaN(data.market_latitude)) {
-            this.marketLatitude = data.market_latitude;
-          }
-          if (typeof data.market_longitude === 'number' && !isNaN(data.market_longitude)) {
-            this.marketLongitude = data.market_longitude;
-          }
-          if (typeof data.gps_radius_meters === 'number' && !isNaN(data.gps_radius_meters)) {
-            this.gpsRadiusMeters = data.gps_radius_meters;
-          }
-
-          console.log(`[CloudBot] Sozlamalar yangilandi: Adminlar=${this.adminIds.join(',')}, GPS Kelish=${this.gpsRequired}, GPS Ketish=${this.gpsCheckoutRequired}, Radius=${this.gpsRadiusMeters}m`);
+          console.log(
+            `[CloudBot] Sozlamalar yangilandi: Adminlar=${this.adminIds.join(',')}, GPS=${this.gpsRequired}, Jarima=${this.latePenaltyEnabled} (${this.lateGracePeriodMinutes}daq, ${this.latePenaltyPerMinuteSum} so'm)`
+          );
 
           if (tokenChanged) {
             console.log(`[CloudBot] Telegram bot tokeni yangilandi. Qayta ishga tushirilmoqda...`);
+            this.botUsername = null;
             this.restartPolling();
           }
         }
@@ -480,8 +503,17 @@ export class CloudTelegramBot {
     }
   }
 
+  // Boshqa instansiya bizdan ustun (yangi yoki yuqori prioritetli) ekanligini qat'iy tartib bilan aniqlash
+  private isRemoteSuperior(remotePriority: number, remoteBootTime: number, remoteLeaderId: string): boolean {
+    if (remotePriority > this.leaderPriority) return true;
+    if (remotePriority < this.leaderPriority) return false;
+    if (remoteBootTime > this.bootTime + 3000) return true;
+    if (this.bootTime > remoteBootTime + 3000) return false;
+    return remoteLeaderId > this.instanceId;
+  }
+
   // Real-vaqtda bot_leader hujjatini kuzatish:
-  // Agar eski (priority_version < 3) server leaderlikni olishga urinsa, 50ms ichida qaytarib olamiz!
+  // Eski versiyadagi server (masalan v4) leaderlikni ushlab turgan bo'lsa, darhol qaytarib olamiz!
   private watchLeadership() {
     if (this.leaderUnsubscribe) return;
     const leaderDocRef = doc(db, 'settings', 'bot_leader');
@@ -492,23 +524,33 @@ export class CloudTelegramBot {
         const data = snap.data() || {};
         const currentLeader = String(data.leader_id || '');
         const remotePriority = Number(data.priority_version || 0);
+        const remoteBootTime = Number(data.boot_time || 0);
         const lastHb = Math.max(Number(data.heartbeat || 0), Number(data.last_heartbeat || 0));
+        const remoteOffset = Number(data.last_offset || 0);
         const now = Date.now();
         this.observedLeaderId = currentLeader || null;
 
+        if (remoteOffset > this.currentOffset) {
+          this.currentOffset = remoteOffset;
+        }
+
         if (currentLeader && currentLeader !== this.instanceId) {
-          // Agar boshqa yuqori yoki teng prioritetli server faol bo'lsa, kutish rejimiga o'tamiz
-          if (remotePriority >= this.leaderPriority && now - lastHb < 15000) {
+          const remoteAlive = now - lastHb < 15000;
+          const remoteSuperior = this.isRemoteSuperior(remotePriority, remoteBootTime, currentLeader);
+
+          if (remoteAlive && remoteSuperior) {
             if (this.isLeader) {
-              console.log(`[CloudBot] Yangi/asosiy server leaderlikni oldi (${currentLeader}, v${remotePriority}). Ushbu nusxa (${this.instanceId}) kutish rejimiga o'tdi.`);
+              console.log(
+                `[CloudBot] Yangi/asosiy server leaderlikni oldi (${currentLeader}, v${remotePriority}). Ushbu nusxa (${this.instanceId}) kutish rejimiga o'tdi.`
+              );
               this.isLeader = false;
               if (this.pollAbortController) {
                 this.pollAbortController.abort();
                 this.pollAbortController = null;
               }
             }
-          } else if (remotePriority < this.leaderPriority && this.botToken) {
-            // Eski versiyadagi server (masalan v0) kirib qolgan bo'lsa, darhol yangi versiya leaderlikni qaytarib oladi!
+          } else if ((!remoteAlive || !remoteSuperior) && this.botToken) {
+            // Eski versiyadagi server (masalan v0..v4) yoki o'chgan server o'rniga darhol yangi versiya leaderlikni oladi!
             this.lastLeaderCheck = 0;
             this.acquireLeadership(true).catch(() => {});
           }
@@ -535,6 +577,8 @@ export class CloudTelegramBot {
             heartbeat: now,
             last_heartbeat: now,
             priority_version: this.leaderPriority,
+            boot_time: this.bootTime,
+            last_offset: this.currentOffset,
             updated_at: new Date(now).toISOString(),
             instance_url: this.webappUrl,
           },
@@ -562,6 +606,11 @@ export class CloudTelegramBot {
           const data = snap.data() || {};
           const currentLeader = String(data.leader_id || '');
           const remotePriority = Number(data.priority_version || 0);
+          const remoteBootTime = Number(data.boot_time || 0);
+          const remoteOffset = Number(data.last_offset || 0);
+          if (remoteOffset > this.currentOffset) {
+            this.currentOffset = remoteOffset;
+          }
           // Ikkala maydonni ham tekshiramiz (`heartbeat` va `last_heartbeat`)
           const lastHeartbeat = Math.max(Number(data.heartbeat || 0), Number(data.last_heartbeat || 0));
 
@@ -569,7 +618,7 @@ export class CloudTelegramBot {
             currentLeader &&
             currentLeader !== this.instanceId &&
             now - lastHeartbeat < 15000 &&
-            remotePriority >= this.leaderPriority
+            this.isRemoteSuperior(remotePriority, remoteBootTime, currentLeader)
           ) {
             return false;
           }
@@ -582,6 +631,8 @@ export class CloudTelegramBot {
             heartbeat: now,
             last_heartbeat: now,
             priority_version: this.leaderPriority,
+            boot_time: this.bootTime,
+            last_offset: this.currentOffset,
             updated_at: new Date(now).toISOString(),
             instance_url: this.webappUrl,
           },
@@ -618,34 +669,17 @@ export class CloudTelegramBot {
     } catch {}
   }
 
-  // Har bir xabar yoki callback_query faqat va faqat 1 marta qayta ishlanishini 100% kafolatlovchi taqsimlangan blokirovka
-  private async claimDistributedMessageLock(lockKey: string): Promise<boolean> {
+  // Har bir xabar yoki callback_query faqat va faqat 1 marta qayta ishlanishini ta'minlovchi tezkor xotira blokirovkasi
+  private claimDistributedMessageLock(lockKey: string): boolean {
     if (this.processedMessageIds.has(lockKey)) {
       return false;
     }
     this.processedMessageIds.add(lockKey);
-    if (this.processedMessageIds.size > 4000) {
+    if (this.processedMessageIds.size > 5000) {
       const first = this.processedMessageIds.values().next().value;
       if (first) this.processedMessageIds.delete(first);
     }
-
-    try {
-      const lockRef = doc(db, 'bot_locks', lockKey);
-      return await runTransaction(db, async (tx) => {
-        const snap = await tx.get(lockRef);
-        if (snap.exists()) {
-          return false; // Boshqa server nusxasi ushbu xabarni allaqachon qabul qilgan!
-        }
-        tx.set(lockRef, {
-          instance_id: this.instanceId,
-          claimed_at: Date.now(),
-        });
-        return true;
-      });
-    } catch (err) {
-      // Tarmoq/tranzaksiya uzilishida faqat faol leader javob qaytaradi
-      return this.isLeader;
-    }
+    return true;
   }
 
   private restartPolling() {
@@ -692,7 +726,7 @@ export class CloudTelegramBot {
         this.pollAbortController = new AbortController();
         // 12 soniyali Long Polling: xabar yozilgan zahoti Telegram 0.05 soniyada darhol push qiladi!
         const timeoutSeconds = 12;
-        const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${this.currentOffset}&timeout=${timeoutSeconds}&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`;
+        const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${this.currentOffset}&timeout=${timeoutSeconds}&allowed_updates=${encodeURIComponent('["message","edited_message","callback_query","channel_post"]')}`;
 
         const res = await fetch(url, {
           signal: this.pollAbortController.signal,
@@ -788,6 +822,7 @@ export class CloudTelegramBot {
             { command: 'tanaffus', description: '☕️ Tanaffusga chiqish' },
             { command: 'qaytdim', description: '▶️ Tanaffusdan qaytish' },
             { command: 'soat', description: '⏱ Mening oylik soatlarim' },
+            { command: 'jarima', description: '⚠️ Kechikish va jarimalar hisobi' },
             { command: 'bugun', description: '📅 Bugungi kunlik hisobot' },
             { command: 'kpi', description: '🏆 KPI va soatlar reytingi' },
             { command: 'live', description: '🔴 Hozir ishda kim bor (Admin)' },
@@ -880,6 +915,31 @@ export class CloudTelegramBot {
     }
 
     return replyMarkup;
+  }
+
+  // Buyruqlarni tozalash va emojilar/belgilar/apostroflarga chidamli normallashtirish
+  private normalizeCommandText(rawText: string): { cmd: string; fullClean: string; startPayload: string } {
+    if (!rawText) return { cmd: '', fullClean: '', startPayload: '' };
+    const clean = rawText
+      .replace(/[\uFE00-\uFE0F\u200B-\u200D\u2060]/g, '')
+      .replace(/[‘’`ʼʻ]/g, "'")
+      .trim();
+
+    const parts = clean.split(/\s+/);
+    let firstToken = parts[0] || '';
+    if (firstToken.startsWith('/') && firstToken.includes('@')) {
+      firstToken = firstToken.split('@')[0];
+    }
+
+    const startPayload = clean.toLowerCase().startsWith('/start ')
+      ? clean.slice(7).trim().toLowerCase()
+      : '';
+
+    return {
+      cmd: firstToken.toLowerCase(),
+      fullClean: clean.toLowerCase(),
+      startPayload,
+    };
   }
 
   private splitLongMessage(text: string, maxLen = 3900): string[] {
@@ -979,15 +1039,23 @@ export class CloudTelegramBot {
         // 2. Agar klaviatura/URL yoki HTML tufayli xatolik bo'lsa, xavfsiz fallback bilan qayta yuboramiz!
         if (!data.ok) {
           console.warn(`[CloudBot] sendMessage ogohlantirish (${chatId}): ${data.description}`);
+          const desc = String(data.description || '').toLowerCase();
+          const isParseError =
+            desc.includes('parse entities') ||
+            desc.includes('entity') ||
+            desc.includes('tag') ||
+            desc.includes('html');
+
           const fallbackBody: any = {
             chat_id: chatId,
-            text: data.description?.includes('parse entities')
-              ? chunks[i].replace(/<[^>]+>/g, '')
-              : chunks[i],
+            text: isParseError ? chunks[i].replace(/<[^>]+>/g, '') : chunks[i],
             disable_web_page_preview: true,
           };
-          if (!data.description?.includes('parse entities')) {
+          if (!isParseError) {
             fallbackBody.parse_mode = 'HTML';
+          }
+          if (isLastChunk && safeMarkup) {
+            fallbackBody.reply_markup = safeMarkup;
           }
           const retryPlain = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
             method: 'POST',
@@ -1015,9 +1083,14 @@ export class CloudTelegramBot {
     }
   }
 
-  // Admin va guruhlarga bildirishnoma yuborish (Telegram Rate Limitga tushmasdan ketma-ket yuborish)
-  // excludeChatId: agar xabar aynan shu chatdan (masalan guruhdan yoki shaxsiy adminga) kelgan bo'lsa, unga 2 marta takroriy bildirishnoma yuborilmaydi!
-  private async notifyAdmins(text: string, excludeChatId?: string | number) {
+  // Admin va guruhlarga bildirishnoma yuborish:
+  // MAXFIYLIK HIMOYASI: Guruh chatlariga (`-100...`) faqat `publicText` (moliyaviy jarima summalarisiz),
+  // shaxsiy Admin chatlariga esa `privateAdminText || publicText` yuboriladi!
+  private async notifyAdmins(
+    publicText: string,
+    excludeChatId?: string | number,
+    privateAdminText?: string
+  ) {
     const rawTargets = this.notifyTargetIds.length > 0 ? this.notifyTargetIds : this.adminIds;
     const excludeStr = excludeChatId !== undefined && excludeChatId !== null ? String(excludeChatId).trim() : null;
     const uniqueTargets = Array.from(new Set(rawTargets.map((t) => String(t).trim()))).filter(
@@ -1025,7 +1098,9 @@ export class CloudTelegramBot {
     );
     for (const target of uniqueTargets) {
       try {
-        await this.sendMessage(target, text);
+        const isGroupTarget = target.startsWith('-');
+        const msgToSend = isGroupTarget ? publicText : (privateAdminText || publicText);
+        await this.sendMessage(target, msgToSend);
         // Telegram API 30 msg/sec cheklovidan himoyalanish uchun 50ms kutish
         await new Promise((r) => setTimeout(r, 50));
       } catch (e) {
@@ -1044,12 +1119,12 @@ export class CloudTelegramBot {
     const keyboard: any[][] = [
       [{ text: '📍 Ishga keldim' }, { text: '🏃‍♂️ Ishdan ketdim' }],
       [{ text: '☕️ Tanaffusga chiqish' }, { text: '▶️ Tanaffusdan qaytish' }],
-      [{ text: '⏱ Mening soatlarim' }, { text: "📅 Sana oralig'i" }],
-      [{ text: '🌐 Veb-portal' }],
+      [{ text: '⏱ Mening soatlarim' }, { text: '⚠️ Jarimalarim' }],
+      [{ text: "📅 Sana oralig'i" }, { text: '🌐 Veb-portal' }],
     ];
 
     if (isAdminUser) {
-      keyboard.push([{ text: '🔴 Hozir ishda kim bor?' }, { text: '🔔 Eslatmalar' }]);
+      keyboard.push([{ text: '🔴 Hozir ishda kim bor?' }, { text: '⚠️ Kechikish va Jarimalar' }]);
       keyboard.push([{ text: '🏆 KPI Reyting' }, { text: '📢 6 Soatlik Monitoring' }]);
       keyboard.push([{ text: '📊 Oylik umumiy hisobot' }, { text: '👥 Ishchilar ro\'yxati' }]);
     }
@@ -1078,6 +1153,50 @@ export class CloudTelegramBot {
       await this.answerCallbackQuery(cb.id, 'Bajarilmoqda...');
 
       if (!targetChatId) return;
+
+      if (data === 'quick_checkin') {
+        await this.handleCheckIn(targetChatId, fromId, isAdmUser);
+        return;
+      }
+
+      if (data.startsWith('wakeup_resp:')) {
+        const parts = data.split(':');
+        const actionType = parts[1]; // 'on_way' | 'late'
+        const user = await this.findUserByTelegramId(fromId);
+        const workerName = user?.full_name || 'Xodim';
+
+        if (actionType === 'on_way') {
+          await this.answerCallbackQuery(cb.id, "🚶‍♂️ Qabul qilindi! Oq yo'l, yetib kelgach '📍 Ishga keldim'ni bosing.", true);
+          await this.sendMessage(
+            targetChatId,
+            `🚶‍♂️ <b>Yo'ldaman deb belgilandi!</b>\n\n` +
+            `Rahmat, <b>${escapeHtml(workerName)}</b>! Do'konga yetib kelgach <b>«📍 Ishga keldim»</b> tugmasini bosishni unutmang.`
+          );
+          // Adminga xabar berish
+          await this.notifyAdmins(
+            `🚶‍♂️ <b>${escapeHtml(workerName)}</b> ishga yo'lda ekanligini bildirdi.`,
+            targetChatId,
+            `🚶‍♂️ <b>${escapeHtml(workerName)}</b> ishga yo'lda ekanligini bildirdi (Ertalabki eslatmaga javoban).`
+          );
+        } else if (actionType === 'late') {
+          await this.answerCallbackQuery(cb.id, "⏰ Qayd etildi! Iloji boricha tezroq yetib keling.", true);
+          const graceTxt = this.latePenaltyEnabled
+            ? `\n\n⚠️ <i>Eslatib o'tamiz: ${this.lateGracePeriodMinutes} daqiqalik ruxsatdan keyin har bir kechikkan daqiqa uchun ${formatUzSum(this.latePenaltyPerMinuteSum)} jarima yoziladi.</i>`
+            : '';
+          await this.sendMessage(
+            targetChatId,
+            `⏰ <b>Kechikish haqidagi bildirishnomangiz qabul qilindi!</b>\n` +
+            `Iltimos, imkon qadar tezroq yetib kelishga harakat qiling.${graceTxt}`
+          );
+          // Adminga xabar berish
+          await this.notifyAdmins(
+            `⏰ <b>${escapeHtml(workerName)}</b> bugun ishga kechikib kelishini bildirdi.`,
+            targetChatId,
+            `⚠️ <b>Kechikish haqida ogohlantirish:</b> <b>${escapeHtml(workerName)}</b> bugun ishga kechikib kelishini bildirdi!`
+          );
+        }
+        return;
+      }
 
       if (data === 'send_6h_now') {
         if (!isAdmUser) {
@@ -1207,15 +1326,11 @@ export class CloudTelegramBot {
       return;
     }
 
-    // Buyruqni tozalash (masalan: /keldim@NavoMarketBot -> /keldim, /start portal -> /start)
-    const firstToken = rawText.split(/\s+/)[0] || '';
-    const cleanCmd = (rawText.startsWith('/') ? firstToken.split('@')[0] : rawText.split('@')[0]).trim().toLowerCase();
-    const startPayload = rawText.toLowerCase().startsWith('/start ')
-      ? rawText.slice(7).trim().toLowerCase()
-      : '';
+    // Buyruqni chuqur tozalash va normallashtirish (emojilar, belgilar, bo'sh joylar va apostroflarga chidamli)
+    const { cmd, fullClean, startPayload } = this.normalizeCommandText(rawText);
 
     // 1.2 Bekor qilish tugmasi
-    if (cleanCmd === '❌ bekor qilish' || cleanCmd === 'bekor qilish' || cleanCmd === '/bekor') {
+    if (cmd === '/bekor' || fullClean.includes('bekor qilish') || fullClean === 'bekor') {
       this.pendingLocationUsers.delete(tgUserId);
       this.pendingCheckoutLocationUsers.delete(tgUserId);
       this.pendingDateRangeUsers.delete(tgUserId);
@@ -1228,18 +1343,19 @@ export class CloudTelegramBot {
       const looksLikeDateInput = /\d{1,4}[./-]\d{1,2}/.test(rawText) || /bugun|bu oy|otgan oy|o'tgan oy/i.test(rawText);
       const isMenuOrSlashCommand =
         rawText.startsWith('/') ||
-        /^(📍|🏃|☕|▶|⏱|🌐|🔴|🔔|🏆|📢|📊|👥|🏁|📅)/.test(rawText);
+        /^(📍|🏃|☕|▶|⏱|⚠️|⚠|🌐|🔴|🔔|🏆|📢|📊|👥|🏁|📅)/.test(rawText) ||
+        fullClean.includes('keldim') ||
+        fullClean.includes('ketdim');
 
       this.pendingDateRangeUsers.delete(tgUserId);
       if (looksLikeDateInput || !isMenuOrSlashCommand) {
         await this.handleDateRangeReport(chatId, tgUserId, isAdm, rawText);
         return;
       }
-      // Aks holda pastdagi tegishli menyu buyrug'i bajariladi!
     }
 
     // 2. Chat/Guruh ID sini bilish buyrug'i (/id, /chatid, /guruh)
-    if (cleanCmd === '/id' || cleanCmd === '/chatid' || cleanCmd === '/guruh') {
+    if (cmd === '/id' || cmd === '/chatid' || cmd === '/guruh' || fullClean === 'id' || fullClean === 'chat id' || fullClean === 'guruh id') {
       const chatType = isGroup ? 'guruh' : 'shaxsiy chat';
       await this.sendMessage(
         chatId,
@@ -1250,7 +1366,7 @@ export class CloudTelegramBot {
     }
 
     // 2.5 Bot statusi va nusxalar soni
-    if (cleanCmd === '/status' || cleanCmd === '/bot' || cleanCmd === '/nechta' || cleanCmd === 'bot' || cleanCmd === 'status') {
+    if (cmd === '/status' || cmd === '/bot' || cmd === '/nechta' || fullClean === 'bot' || fullClean === 'status') {
       const webhookInfo = await this.getWebhookInfo().catch(() => null);
       const extUrl = webhookInfo?.result?.url;
       const tp = getTashkentParts();
@@ -1259,9 +1375,10 @@ export class CloudTelegramBot {
         `🤖 <b>${escapeHtml(this.shopName)} — Bot Tizimi Holati:</b>\n\n` +
           `• <b>Bot:</b> @${this.botUsername || 'navodavomat_bot'}\n` +
           `• <b>Faol yagona server:</b> <code>${this.instanceId}</code> (v${this.leaderPriority})\n` +
-          `• <b>Ishlash rejimi:</b> 24/7 Google Cloud Long Polling (0.05s tezkor)\n` +
+          `• <b>Ishlash rejimi:</b> 24/7 Google Cloud Long Polling (Tezkor va barqaror)\n` +
           `• <b>Tashqi Webhook:</b> ${extUrl ? `⚠️ Faol (${extUrl})` : `✅ Tozalangan (xalaqit yo'q)`}\n` +
-          `• <b>Dublikat himoyasi:</b> ✅ Atomik Firestore Lock + Leader Himoyasi (100%)\n` +
+          `• <b>Kechikish jarimasi:</b> ${this.latePenaltyEnabled ? `✅ Faol (${this.lateGracePeriodMinutes} daq ruxsat, 1 daq = ${this.latePenaltyPerMinuteSum.toLocaleString()} so'm)` : `⏸ O'chiq`}\n` +
+          `• <b>Dublikat himoyasi:</b> ✅ Atomik Xotira Qulfi + Leader Himoyasi (100%)\n` +
           `• <b>Toshkent vaqti:</b> ${tp.dateStr} ${tp.timeStr}\n` +
           `• <b>Qayta ishlangan buyruqlar:</b> ${this.updatesProcessedCount} ta\n` +
           `• <b>Oxirgi faollik:</b> ${this.lastUpdateReceivedAt || 'Hozirgina'}`
@@ -1270,9 +1387,13 @@ export class CloudTelegramBot {
     }
 
     // 3. /start buyrug'i (va deep-link qo'llab-quvvatlashi)
-    if (cleanCmd === '/start') {
+    if (cmd === '/start') {
       if (startPayload === 'portal' && !isGroup) {
         await this.handleAppCommand(chatId, tgUserId, isAdm);
+        return;
+      }
+      if (startPayload === 'jarima' && !isGroup) {
+        await this.handleLatePenaltiesCommand(chatId, tgUserId, isAdm);
         return;
       }
       if (startPayload === 'keldim' && !isGroup) {
@@ -1289,6 +1410,7 @@ export class CloudTelegramBot {
             `☕️ <b>/tanaffus</b> — Tanaffusga chiqish\n` +
             `▶️ <b>/qaytdim</b> — Tanaffusdan qaytish\n` +
             `⏱ <b>/soat</b> — Oylik ishlagan soatlaringiz\n` +
+            `⚠️ <b>/jarima</b> — Shaxsiy kechikish va jarimalar (shaxsiy botda)\n` +
             `📅 <b>/oraliq</b> — Sanalar oralig'i hisoboti\n` +
             `📅 <b>/bugun</b> — Bugungi davomat ro'yxati\n` +
             `🆔 <b>/id</b> — Ushbu guruh ID raqamini ko'rish\n\n` +
@@ -1300,61 +1422,143 @@ export class CloudTelegramBot {
       return;
     }
 
-    // 4. Davomat buyruqlari (ham shaxsiy botda, ham guruhda ishlaydi)
-    if (
-      cleanCmd === '📍 ishga keldim' ||
-      cleanCmd === 'ishga keldim' ||
-      cleanCmd === '/keldim' ||
-      cleanCmd === '/in' ||
-      cleanCmd === 'keldim' ||
-      cleanCmd === 'ishga kelish'
-    ) {
+    // 4. Davomat buyruqlari (har qanday variantda xatoliksiz aniqlanadi)
+    const isCheckIn =
+      cmd === '/keldim' ||
+      cmd === '/in' ||
+      cmd === 'keldim' ||
+      fullClean === 'keldim' ||
+      fullClean.includes('ishga keldim') ||
+      fullClean.includes('ishga kelish') ||
+      (fullClean.startsWith('📍') && fullClean.includes('keldim'));
+
+    const isCheckOut =
+      cmd === '/ketdim' ||
+      cmd === '/out' ||
+      cmd === 'ketdim' ||
+      fullClean === 'ketdim' ||
+      fullClean.includes('ishdan ketdim') ||
+      fullClean.includes('ishdan ketish') ||
+      (fullClean.startsWith('🏃') && fullClean.includes('ketdim'));
+
+    const isBreakStart =
+      cmd === '/tanaffus' ||
+      cmd === '/break' ||
+      cmd === 'tanaffus' ||
+      fullClean.includes('tanaffusga chiqish') ||
+      (fullClean.includes('tanaffus') && !fullClean.includes('qayt'));
+
+    const isBreakEnd =
+      cmd === '/qaytdim' ||
+      cmd === '/resume' ||
+      cmd === 'qaytdim' ||
+      fullClean.includes('tanaffusdan qaytish') ||
+      fullClean.includes('ishga qaytdim') ||
+      fullClean === 'qaytdim';
+
+    const isMyHours =
+      cmd === '/soat' ||
+      cmd === '/soatlarim' ||
+      cmd === '/vaqtim' ||
+      cmd === 'soat' ||
+      fullClean === 'soat' ||
+      fullClean === 'soatlarim' ||
+      fullClean.includes('mening soatlarim');
+
+    const isPenalties =
+      cmd === '/jarima' ||
+      cmd === '/jarimalar' ||
+      cmd === '/jarimalarim' ||
+      cmd === 'jarima' ||
+      fullClean === 'jarima' ||
+      fullClean === 'jarimalar' ||
+      fullClean.includes('jarimalar') ||
+      fullClean.includes('kechikish va jarima');
+
+    const isLive =
+      cmd === '/live' ||
+      cmd === 'live' ||
+      fullClean.includes('hozir ishda kim bor') ||
+      fullClean.includes('kim ishda');
+
+    const isKpi =
+      cmd === '/kpi' ||
+      cmd === '/reyting' ||
+      cmd === 'kpi' ||
+      fullClean.includes('kpi') ||
+      fullClean.includes('reyting');
+
+    const isReport =
+      cmd === '/hisobot' ||
+      cmd === 'hisobot' ||
+      fullClean.includes('oylik umumiy hisobot') ||
+      fullClean === 'hisobot';
+
+    const isWorkers =
+      cmd === '/ishchilar' ||
+      cmd === 'ishchilar' ||
+      fullClean.includes('ishchilar ro');
+
+    const isToday =
+      cmd === '/bugun' ||
+      cmd === 'bugun' ||
+      fullClean === 'bugun' ||
+      fullClean.includes('bugungi davomat') ||
+      fullClean.includes('bugungi hisobot');
+
+    const isDateRange =
+      cmd.startsWith('/oraliq') ||
+      cmd.startsWith('/davr') ||
+      cmd.startsWith('/range') ||
+      fullClean.includes("sana oralig");
+
+    const isApp =
+      cmd === '/app' ||
+      cmd === '/webapp' ||
+      cmd === '/portal' ||
+      cmd === 'portal' ||
+      fullClean.includes('veb-portal') ||
+      fullClean.includes('veb portal') ||
+      fullClean === 'portal';
+
+    const isMonitoring =
+      cmd === '/monitoring' ||
+      cmd === '/send6h' ||
+      cmd === '/xulosa6h' ||
+      fullClean.includes('6 soatlik monitoring') ||
+      fullClean === 'monitoring';
+
+    const isReminders =
+      cmd === '/eslatma' ||
+      cmd === '/eslatmalar' ||
+      fullClean.includes('eslatma');
+
+    const isDailyClosing =
+      cmd === '/kunyakun' ||
+      cmd === '/bugunyakun' ||
+      cmd === '/yopilish' ||
+      fullClean.includes('kunlik hisobot') ||
+      fullClean.includes('kun yakun');
+
+    const isHelp =
+      cmd === '/help' ||
+      cmd === '/yordam' ||
+      fullClean === 'help' ||
+      fullClean === 'yordam';
+
+    if (isCheckIn) {
       await this.handleCheckIn(chatId, tgUserId, isAdm);
-    } else if (
-      cleanCmd === '☕️ tanaffusga chiqish' ||
-      cleanCmd === '☕ tanaffusga chiqish' ||
-      cleanCmd === 'tanaffusga chiqish' ||
-      cleanCmd === '/tanaffus' ||
-      cleanCmd === '/break' ||
-      cleanCmd === 'tanaffus'
-    ) {
+    } else if (isBreakStart) {
       await this.handleBreakStart(chatId, tgUserId);
-    } else if (
-      cleanCmd === '▶️ tanaffusdan qaytish' ||
-      cleanCmd === '▶ tanaffusdan qaytish' ||
-      cleanCmd === 'tanaffusdan qaytish' ||
-      cleanCmd === '/qaytdim' ||
-      cleanCmd === '/resume' ||
-      cleanCmd === 'qaytdim'
-    ) {
+    } else if (isBreakEnd) {
       await this.handleBreakEnd(chatId, tgUserId);
-    } else if (
-      cleanCmd === '🏃‍♂️ ishdan ketdim' ||
-      cleanCmd === '🏃 ishdan ketdim' ||
-      cleanCmd === 'ishdan ketdim' ||
-      cleanCmd === '/ketdim' ||
-      cleanCmd === '/out' ||
-      cleanCmd === 'ketdim' ||
-      cleanCmd === 'ishdan ketish'
-    ) {
+    } else if (isCheckOut) {
       await this.handleCheckOut(chatId, tgUserId);
-    } else if (
-      cleanCmd === '⏱ mening soatlarim' ||
-      cleanCmd === 'mening soatlarim' ||
-      cleanCmd === 'soatlarim' ||
-      cleanCmd === '/soatlarim' ||
-      cleanCmd === '/soat' ||
-      cleanCmd === '/vaqtim' ||
-      cleanCmd === 'soat'
-    ) {
+    } else if (isMyHours) {
       await this.handleMyHours(chatId, tgUserId);
-    } else if (
-      cleanCmd === '🔴 hozir ishda kim bor?' ||
-      cleanCmd === 'hozir ishda kim bor?' ||
-      cleanCmd === 'hozir ishda kim bor' ||
-      cleanCmd === '/live' ||
-      cleanCmd === 'live'
-    ) {
+    } else if (isPenalties) {
+      await this.handleLatePenaltiesCommand(chatId, tgUserId, isAdm);
+    } else if (isLive) {
       if (isAdm) {
         await this.handleAdminLive(chatId);
       } else {
@@ -1363,21 +1567,9 @@ export class CloudTelegramBot {
           `ℹ️ Ushbu ma'lumot faqat do'kon ma'muri (Admin) uchun ochiq. O'zingizning ishlagan vaqtingizni ko'rish uchun <b>'⏱ Mening soatlarim'</b> tugmasini bosing.`
         );
       }
-    } else if (
-      cleanCmd === '🏆 kpi reyting' ||
-      cleanCmd === 'kpi reyting' ||
-      cleanCmd === '/kpi' ||
-      cleanCmd === '/reyting' ||
-      cleanCmd === 'kpi' ||
-      cleanCmd === 'reyting'
-    ) {
+    } else if (isKpi) {
       await this.handleKpiRatingCommand(chatId);
-    } else if (
-      cleanCmd === '📊 oylik umumiy hisobot' ||
-      cleanCmd === 'oylik umumiy hisobot' ||
-      cleanCmd === '/hisobot' ||
-      cleanCmd === 'hisobot'
-    ) {
+    } else if (isReport) {
       if (isAdm) {
         await this.handleAdminReport(chatId);
       } else {
@@ -1386,15 +1578,7 @@ export class CloudTelegramBot {
           `ℹ️ Oylik umumiy hisobot faqat do'kon ma'muri (Admin) uchun ochiq. Shaxsiy soatlaringizni <b>'⏱ Mening soatlarim'</b> orqali bilib olasiz.`
         );
       }
-    } else if (
-      cleanCmd === '👥 ishchilar ro\'yxati' ||
-      cleanCmd === '👥 ishchilar royxati' ||
-      cleanCmd === 'ishchilar ro\'yxati' ||
-      cleanCmd === 'ishchilar royxati' ||
-      cleanCmd === 'ishchilar ro‘yxati' ||
-      cleanCmd === '/ishchilar' ||
-      cleanCmd === 'ishchilar'
-    ) {
+    } else if (isWorkers) {
       if (isAdm) {
         await this.handleAdminWorkers(chatId);
       } else {
@@ -1403,41 +1587,13 @@ export class CloudTelegramBot {
           `ℹ️ Ishchilar ro'yxati faqat do'kon ma'muri uchun ochiq.`
         );
       }
-    } else if (cleanCmd === '/bugun' || cleanCmd === 'bugun') {
+    } else if (isToday) {
       await this.handleTodaySummary(chatId, tgUserId, isAdm);
-    } else if (
-      cleanCmd.startsWith('/oraliq') ||
-      cleanCmd.startsWith('/davr') ||
-      cleanCmd.startsWith('/range') ||
-      cleanCmd === 'oraliq' ||
-      cleanCmd === 'davr' ||
-      cleanCmd === 'range' ||
-      cleanCmd === "📅 sana oralig'i" ||
-      cleanCmd === "📅 sana oraligi" ||
-      cleanCmd === "sana oralig'i" ||
-      cleanCmd === "sana oraligi" ||
-      cleanCmd === "sana oralig‘i" ||
-      cleanCmd.startsWith('sana oralig')
-    ) {
+    } else if (isDateRange) {
       await this.handleDateRangeReport(chatId, tgUserId, isAdm, rawText);
-    } else if (
-      cleanCmd === '/app' ||
-      cleanCmd === '/webapp' ||
-      cleanCmd === '/portal' ||
-      cleanCmd === '🌐 veb-portal' ||
-      cleanCmd === 'veb-portal' ||
-      cleanCmd === 'veb portal' ||
-      cleanCmd === 'portal'
-    ) {
+    } else if (isApp) {
       await this.handleAppCommand(chatId, tgUserId, isAdm);
-    } else if (
-      cleanCmd === '📢 6 soatlik monitoring' ||
-      cleanCmd === '6 soatlik monitoring' ||
-      cleanCmd === '/send6h' ||
-      cleanCmd === '/monitoring' ||
-      cleanCmd === '/xulosa6h' ||
-      cleanCmd === 'monitoring'
-    ) {
+    } else if (isMonitoring) {
       if (isAdm) {
         await this.handleSend6hCommand(chatId);
       } else {
@@ -1446,12 +1602,7 @@ export class CloudTelegramBot {
           `ℹ️ 6 soatlik monitoring xulosasini faqat Admin yuborishi mumkin.`
         );
       }
-    } else if (
-      cleanCmd === '🔔 eslatmalar' ||
-      cleanCmd === 'eslatmalar' ||
-      cleanCmd === '/eslatma' ||
-      cleanCmd === '/eslatmalar'
-    ) {
+    } else if (isReminders) {
       if (isAdm) {
         await this.handleAdminRemindersCommand(chatId);
       } else {
@@ -1460,13 +1611,7 @@ export class CloudTelegramBot {
           `ℹ️ Eslatmalar menyusi faqat do'kon ma'muri uchun ochiq.`
         );
       }
-    } else if (
-      cleanCmd === '🏁 kunlik hisobot' ||
-      cleanCmd === 'kunlik hisobot' ||
-      cleanCmd === '/kunyakun' ||
-      cleanCmd === '/bugunyakun' ||
-      cleanCmd === '/yopilish'
-    ) {
+    } else if (isDailyClosing) {
       if (isAdm) {
         await this.handleDailyClosingReportCommand(chatId);
       } else {
@@ -1475,7 +1620,7 @@ export class CloudTelegramBot {
           `ℹ️ Kunlik yakuniy hisobot faqat do'kon ma'muri uchun ochiq.`
         );
       }
-    } else if (cleanCmd === '/help' || cleanCmd === '/yordam' || cleanCmd === 'yordam') {
+    } else if (isHelp) {
       await this.handleHelp(chatId, isAdm);
     } else if (!isGroup) {
       // Shaxsiy chatda noma'lum matn yozilsa, foydalanuvchiga yordam berish
@@ -1531,12 +1676,13 @@ export class CloudTelegramBot {
     }
   }
 
-  // --- Kontaktni qabul qilish ---
+  // --- Kontaktni qabul qilish (Telefon raqamni oxirgi 9 ta raqami bo'yicha aniq moslashtiradi) ---
   private async handleContact(message: any) {
     const tgUserId = String(message.from.id);
     const contact = message.contact;
     const rawPhone = contact.phone_number || '';
     const cleanPhone = rawPhone.replace(/\D/g, '');
+    const last9Digits = cleanPhone.slice(-9);
     const standardPhone = cleanPhone.startsWith('998')
       ? cleanPhone
       : cleanPhone.length === 9
@@ -1547,22 +1693,31 @@ export class CloudTelegramBot {
     const lName = (message.from.last_name || '').trim();
     const fullName = `${fName} ${lName}`.trim() || 'Xodim';
 
-    // Firestore da qidirish yoki yangi xodim qo'shish
-    const usersRef = collection(db, 'users');
-    const qPhone = query(usersRef, where('phone', '==', `+${standardPhone}`));
-    const snap = await getDocs(qPhone);
+    // Firestore dagi mavjud xodimlarni tekshirish (dublikat profil ochilib ketmasligi uchun!)
+    const usersSnap = await getDocs(collection(db, 'users'));
+    let matchedDoc: User | null = null;
+    usersSnap.forEach((d) => {
+      const u = d.data() as User;
+      const uId = Number(u.id || d.id);
+      const uTg = String(u.telegram_id || '').trim();
+      const uPhoneDigits = String(u.phone || '').replace(/\D/g, '');
+      if (uTg === tgUserId) {
+        matchedDoc = { ...u, id: uId };
+      } else if (!matchedDoc && last9Digits.length === 9 && uPhoneDigits.slice(-9) === last9Digits) {
+        matchedDoc = { ...u, id: uId };
+      }
+    });
 
     let finalUserId: number;
     let finalUser: User;
 
-    if (!snap.empty) {
-      const docSnap = snap.docs[0];
-      const existing = docSnap.data() as User;
+    if (matchedDoc) {
+      const existing = matchedDoc as User;
       finalUserId = existing.id;
       finalUser = {
         ...existing,
         telegram_id: tgUserId,
-        phone: `+${standardPhone}`,
+        phone: existing.phone || `+${standardPhone}`,
       };
       await setDoc(doc(db, 'users', String(finalUserId)), finalUser, { merge: true });
     } else {
@@ -1593,7 +1748,7 @@ export class CloudTelegramBot {
     );
 
     await this.notifyAdmins(
-      `👤 <b>Yangi xodim Telegram orqali ulandi:</b>\n` +
+      `👤 <b>Xodim Telegram orqali ulandi:</b>\n` +
         `Ism: <b>${escapeHtml(finalUser.full_name)}</b>\n` +
         `Tel: ${finalUser.phone}`,
       message.chat.id
@@ -1607,11 +1762,13 @@ export class CloudTelegramBot {
     isAdm: boolean,
     coords?: { lat: number; lon: number; dist: number }
   ) {
-    const lastAction = this.userActionLocks.get(tgUserId);
-    if (lastAction && Date.now() - lastAction < 3000) {
-      return; // Tez-tez qayta bosishni to'xtatish
+    // MUHIM: Lokatsiya yuborilganda (`coords` mavjud bo'lganda) oldingi so'rov qulfi uni to'sib qo'ymasligi uchun alohida kalit ishlatiladi!
+    const lockKey = coords ? `checkin_gps_${tgUserId}` : `checkin_req_${tgUserId}`;
+    const lastAction = this.userActionLocks.get(lockKey);
+    if (lastAction && Date.now() - lastAction < 800) {
+      return;
     }
-    this.userActionLocks.set(tgUserId, Date.now());
+    this.userActionLocks.set(lockKey, Date.now());
 
     const user = await this.findUserByTelegramId(tgUserId);
     if (!user) {
@@ -1640,7 +1797,7 @@ export class CloudTelegramBot {
         return;
       }
 
-      // Agar avvalgi smena juda uzoq (16+ soat yoki eski kungi) bo'lsa, xavfsiz yopamiz
+      // Agar avvalgi smena eski kungi bo'lsa, xavfsiz yopamiz
       const isOldDay = activeShift.date < todayStr;
       if (isOldDay) {
         const endTime = user.work_end_time || '20:00';
@@ -1652,6 +1809,12 @@ export class CloudTelegramBot {
           activeShift.total_break_minutes || 0
         );
         const resolvedMinutes = calcMinutes > 0 && calcMinutes <= 840 ? calcMinutes : 600;
+        const oldPenalty = calculateLatePenaltyAmount(
+          activeShift.check_in_time,
+          user.work_start_time || '08:00',
+          1,
+          this.getPenaltySettings()
+        );
 
         await setDoc(
           doc(db, 'attendance', String(activeShift.id)),
@@ -1660,7 +1823,10 @@ export class CloudTelegramBot {
             check_out_date: activeShift.date,
             check_out_time: `${endTime}:00`,
             worked_minutes: resolvedMinutes,
-            note: 'Avvalgi kungi unutilgan smena ish rejasi bo\'yicha avtomatik yopildi',
+            late_minutes: oldPenalty.lateMinutes,
+            chargeable_late_minutes: oldPenalty.chargeableLateMinutes,
+            late_penalty: oldPenalty.penaltyAmount,
+            note: "Avvalgi kungi unutilgan smena ish rejasi bo'yicha avtomatik yopildi",
           },
           { merge: true }
         );
@@ -1683,39 +1849,65 @@ export class CloudTelegramBot {
     const isGroup = chatId < 0;
 
     // AGAR GPS MAJBURIY BO'LSA VA LOKATSIYA HALI TASDIQLANMAGAN BO'LSA:
-    // (Faqat shaxsiy botda GPS tugmasi chiqadi. Guruhda Telegram geolokatsiya tugmasini qo'llab-quvvatlamagani
-    // sababli xodimning davomati yo'qolib ketmasligi uchun smena to'g'ridan-to'g'ri ochiladi!)
-    if (this.gpsRequired && !coords && !isGroup) {
-      this.pendingLocationUsers.set(tgUserId, {
-        chatId,
-        isAdm,
-        isGroup,
-        timestamp: Date.now(),
-      });
+    if (this.gpsRequired && !coords) {
+      if (isGroup && !isAdm) {
+        // Guruhda oddiy xodimlar do'konda ekanligini GPS orqali tasdiqlashi shart (bitta joyda ishlashi uchun)
+        await this.sendMessage(
+          chatId,
+          `📍 <b>${escapeHtml(user.full_name)}</b>, do'kon qoidasiga ko'ra ishga kelish geolokatsiya (GPS) orqali faqat do'konda tasdiqlanadi!\n\n` +
+            `Iltimos, botga shaxsiy xabar yozing: @${this.botUsername || 'navodavomat_bot'} va pastdagi <b>«📍 Ishga keldim»</b> tugmasi orqali do'kondagi lokatsiyangizni yuboring.`
+        );
+        return;
+      }
+      if (!isGroup) {
+        this.pendingLocationUsers.set(tgUserId, {
+          chatId,
+          isAdm,
+          isGroup,
+          timestamp: Date.now(),
+        });
 
-      await this.sendMessage(
-        chatId,
-        `📍 <b>Do'konda ekanligingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
-          `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
-          `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b>\n\n` +
-          `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish»</b> tugmasini bosing:`,
-        {
-          keyboard: [
-            [{ text: "📍 Do'kondan lokatsiya yuborish", request_location: true }],
-            [{ text: "❌ Bekor qilish" }],
-          ],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        }
-      );
-      return;
+        await this.sendMessage(
+          chatId,
+          `📍 <b>Do'konda ekanligingizni tasdiqlash uchun geolokatsiyangizni yuboring!</b>\n\n` +
+            `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
+            `📏 Ruxsat etilgan masofa: <b>${this.gpsRadiusMeters} metr</b> (bino ichida GPS xatoligi hisobi bilan 250m gacha qabul qilinadi)\n\n` +
+            `👇 Pastdagi <b>«📍 Do'kondan lokatsiya yuborish»</b> tugmasini bosing:`,
+          {
+            keyboard: [
+              [{ text: "📍 Do'kondan lokatsiya yuborish", request_location: true }],
+              [{ text: '❌ Bekor qilish' }],
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          }
+        );
+        return;
+      }
     }
 
     // Bugungi yakunlangan smenalar sonini bilish
     const completedToday = await this.countCompletedShiftsToday(user.id, todayStr);
     const shiftNum = completedToday + 1;
+    const isFirstShift = completedToday === 0;
 
-    // Yangi smena yaratish
+    // Boshliq va adminlar hech qachon kechikish jarimasiga tortilmaydi!
+    const isBossOrAdmin =
+      isAdm ||
+      user.role === 'admin' ||
+      /boshliq|admin|rahbar|direktor|owner/i.test(user.position || '');
+
+    // Kechikish va jarimani jonli Firestore sozlamalari bo'yicha hisoblash
+    const penaltyRes = isBossOrAdmin
+      ? { lateMinutes: 0, chargeableLateMinutes: 0, penaltyAmount: 0 }
+      : calculateLatePenaltyAmount(
+          timeStr,
+          user.work_start_time || '08:00',
+          shiftNum,
+          this.getPenaltySettings()
+        );
+
+    // Yangi smena yaratish va jarimani Attendance ob'ektiga yozish
     const newAttId = Date.now();
     const locNote = coords
       ? `GPS tasdiqlandi (${coords.dist}m)`
@@ -1731,6 +1923,9 @@ export class CloudTelegramBot {
       ...(coords ? { check_in_lat: coords.lat, check_in_lon: coords.lon } : {}),
       total_break_minutes: 0,
       worked_minutes: 0,
+      late_minutes: penaltyRes.lateMinutes,
+      chargeable_late_minutes: penaltyRes.chargeableLateMinutes,
+      late_penalty: penaltyRes.penaltyAmount,
       status: 'working',
       created_at: now.toISOString(),
       note: locNote,
@@ -1738,13 +1933,19 @@ export class CloudTelegramBot {
 
     await setDoc(doc(db, 'attendance', String(newAttId)), newAttendance);
 
-    const isFirstShift = completedToday === 0;
     const shiftText = completedToday > 0 ? ` (${shiftNum}-smena)` : '';
     let lateNote = '';
+    let privatePenaltyNote = '';
     if (isFirstShift) {
-      const lateMins = calculateLateMinutes(timeStr, user.work_start_time || '08:00');
-      if (lateMins > 0) {
-        lateNote = `\n⚠️ Rejadan kechikish: <b>${lateMins} daqiqa</b> (Reja: ${user.work_start_time || '08:00'})`;
+      if (penaltyRes.lateMinutes > 0) {
+        lateNote = `\n⚠️ Rejadan kechikish: <b>${penaltyRes.lateMinutes} daqiqa</b> (Reja: ${user.work_start_time || '08:00'})`;
+        if (this.latePenaltyEnabled) {
+          if (penaltyRes.penaltyAmount > 0) {
+            privatePenaltyNote = `\n⚠️ Kechikish jarimasi: <b>${formatUzSum(penaltyRes.penaltyAmount)}</b> (${this.lateGracePeriodMinutes} daq ruxsatdan keyin ${penaltyRes.chargeableLateMinutes} daq × ${this.latePenaltyPerMinuteSum.toLocaleString()} so'm)`;
+          } else {
+            privatePenaltyNote = `\nℹ️ Kechikish ${this.lateGracePeriodMinutes} daqiqalik ruxsat ichida — jarima yozilmadi (0 so'm)`;
+          }
+        }
       } else {
         lateNote = `\n✅ O'z vaqtida keldi (Reja: ${user.work_start_time || '08:00'})`;
       }
@@ -1756,28 +1957,46 @@ export class CloudTelegramBot {
       ? `\n📍 Lokatsiya: <b>Do'konda (GPS tasdiqlandi: ${coords.dist}m)</b>`
       : '';
 
+    // MAXFIYLIK: Guruhda javob qaytganda jarima summasi boshqa xodimlarga oshkor qilinmaydi!
+    const workerReplyPenalty = !isGroup ? privatePenaltyNote : '';
+
     await this.sendMessage(
       chatId,
       `✅ <b>Ishga kelganingiz qayd etildi!${shiftText}</b>\n\n` +
         `👤 Xodim: <b>${escapeHtml(user.full_name)}</b>\n` +
         `🕒 Kelgan vaqt: <b>${timeStr.slice(0, 5)}</b> (${todayStr})` +
         locTextForUser +
-        `${lateNote}\n\n` +
+        `${lateNote}` +
+        `${workerReplyPenalty}\n\n` +
         `Kuningiz barakali va sermahsul o'tsin!`,
       this.getMainKeyboard(isAdm)
     );
+
+    // Agar xodim guruh ichida /keldim bosgan bo'lsa va unga jarima yozilgan bo'lsa, faqat o'zining shaxsiy chatiga maxfiy xabar yuboramiz
+    if (isGroup && penaltyRes.penaltyAmount > 0 && tgUserId) {
+      this.sendMessage(
+        tgUserId,
+        `🔒 <b>Shaxsiy bildirishnoma (${escapeHtml(this.shopName)}):</b>\n` +
+          `Bugun (${todayStr}) smenaga <b>${penaltyRes.lateMinutes} daqiqa</b> kechikib kelganingiz sababli (${this.lateGracePeriodMinutes} daq ruxsatdan tashqari ${penaltyRes.chargeableLateMinutes} daq) hisobingizga <b>${formatUzSum(penaltyRes.penaltyAmount)}</b> jarima qayd etildi.\n\n` +
+          `<i>Batafsil ko'rish uchun: /jarima</i>`
+      ).catch(() => {});
+    }
 
     const adminLocLine = coords
       ? `📍 Masofa: <b>Do'konda (${coords.dist} metr)</b>\n`
       : '';
 
-    await this.notifyAdmins(
+    const publicGroupNotify =
       `🟢 <b>Ishga keldi:</b> ${escapeHtml(user.full_name)}\n` +
-        `🕒 Vaqt: <b>${timeStr.slice(0, 5)}</b> (${todayStr})\n` +
-        adminLocLine +
-        `Smena: <b>${shiftNum}</b>${isFirstShift ? '' : ' (Qaytadan kirish — kechikish yo\'q)'}`,
-      chatId
-    );
+      `🕒 Vaqt: <b>${timeStr.slice(0, 5)}</b> (${todayStr})\n` +
+      adminLocLine +
+      `Smena: <b>${shiftNum}</b>${isFirstShift ? (penaltyRes.lateMinutes > 0 ? ` (⚠️ ${penaltyRes.lateMinutes} daq kechikdi)` : ` (✅ O'z vaqtida)`) : " (Qaytadan kirish — kechikish yo'q)"}`;
+
+    const privateAdminNotify =
+      publicGroupNotify +
+      (privatePenaltyNote ? `${privatePenaltyNote}` : '');
+
+    await this.notifyAdmins(publicGroupNotify, chatId, privateAdminNotify);
   }
 
   // --- 📍 Geolokatsiya xabari kelganda ---
@@ -1832,13 +2051,14 @@ export class CloudTelegramBot {
       return;
     }
 
-    if (this.gpsRequired && roundedDist > this.gpsRadiusMeters) {
+    const allowedRadius = Math.max(this.gpsRadiusMeters + 150, 250);
+    if (this.gpsRequired && roundedDist > allowedRadius) {
       await this.sendMessage(
         chatId,
         `❌ <b>Siz do'kondan juda uzoqdasiz (${roundedDist} metr)!</b>\n\n` +
           `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
-          `📏 Ruxsat etilgan radius: <b>${this.gpsRadiusMeters} metr</b>.\n\n` +
-          `Iltimos, haqiqatan ham do'konga yetib borgach qaytadan lokatsiya yuboring.` +
+          `📏 Ruxsat etilgan radius: <b>${this.gpsRadiusMeters} metr</b> (GPS xatoligi hisobi bilan ${allowedRadius}m).\n\n` +
+          `Ishga kelish faqat do'konda (bitta joyda) qabul qilinadi. Haqiqatda do'konga yetib borgach qaytadan lokatsiya yuboring.` +
           (isAdm
             ? `\n\n<i>🛡 Boshqaruvchi uchun: Agar masofani kengaytirmoqchi bo'lsangiz, tizim Sozlamalarida GPS radiusini o'zgartirishingiz mumkin.</i>`
             : ''),
@@ -1972,11 +2192,12 @@ export class CloudTelegramBot {
     tgUserId: string,
     coords?: { lat: number; lon: number; dist: number }
   ) {
-    const lastAction = this.userActionLocks.get(tgUserId);
-    if (lastAction && Date.now() - lastAction < 3000) {
-      return; // Tez-tez qayta bosishni to'xtatish
+    const lockKey = coords ? `checkout_gps_${tgUserId}` : `checkout_req_${tgUserId}`;
+    const lastAction = this.userActionLocks.get(lockKey);
+    if (lastAction && Date.now() - lastAction < 2500) {
+      return;
     }
-    this.userActionLocks.set(tgUserId, Date.now());
+    this.userActionLocks.set(lockKey, Date.now());
 
     const user = await this.findUserByTelegramId(tgUserId);
     if (!user) {
@@ -1998,13 +2219,13 @@ export class CloudTelegramBot {
     }
 
     const isGroup = chatId < 0;
+    const isAdm = this.isAdmin(tgUserId);
 
     // AGAR KETISHDA GPS MAJBURIY BO'LSA VA LOKATSIYA HALI TASDIQLANMAGAN BO'LSA:
-    // Faqat shaxsiy chatda GPS tugmasi chiqariladi, guruhda esa davomat yo'qolib ketmasligi uchun smena to'g'ridan-to'g'ri yopiladi!
     if (this.gpsCheckoutRequired && !coords && !isGroup) {
       this.pendingCheckoutLocationUsers.set(tgUserId, {
         chatId,
-        isAdm: this.isAdmin(tgUserId),
+        isAdm,
         isGroup,
         timestamp: Date.now(),
       });
@@ -2018,7 +2239,7 @@ export class CloudTelegramBot {
         {
           keyboard: [
             [{ text: "📍 Do'kondan lokatsiya yuborish (Ketish)", request_location: true }],
-            [{ text: "❌ Bekor qilish" }],
+            [{ text: '❌ Bekor qilish' }],
           ],
           resize_keyboard: true,
           one_time_keyboard: true,
@@ -2051,6 +2272,38 @@ export class CloudTelegramBot {
       totalBreak
     );
 
+    // Ushbu smena kunning nechanchi smenasi ekanligini aniqlab, kechikish jarimasini Attendance ob'ektiga saqlash
+    const sameDaySnap = await getDocs(
+      query(
+        collection(db, 'attendance'),
+        where('user_id', '==', user.id),
+        where('date', '==', activeShift.date)
+      )
+    );
+    const sameDayList: Attendance[] = [];
+    sameDaySnap.forEach((d) => {
+      const raw = d.data() as Attendance;
+      sameDayList.push({ ...raw, id: Number(raw.id || d.id) });
+    });
+    sameDayList.sort(
+      (a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || '') || a.id - b.id
+    );
+    const shiftIdx = Math.max(1, sameDayList.findIndex((item) => item.id === activeShift.id) + 1);
+
+    const isBossOrAdmin =
+      isAdm ||
+      user.role === 'admin' ||
+      /boshliq|admin|rahbar|direktor|owner/i.test(user.position || '');
+
+    const penaltyInfo = isBossOrAdmin
+      ? { lateMinutes: 0, chargeableLateMinutes: 0, penaltyAmount: 0 }
+      : calculateLatePenaltyAmount(
+          activeShift.check_in_time,
+          user.work_start_time || '08:00',
+          shiftIdx,
+          this.getPenaltySettings()
+        );
+
     const locNote = coords
       ? `Ketishda GPS tasdiqlandi (${coords.dist}m)`
       : this.gpsCheckoutRequired
@@ -2065,6 +2318,9 @@ export class CloudTelegramBot {
         check_out_time: timeStr,
         worked_minutes: workedMinutes,
         total_break_minutes: totalBreak,
+        late_minutes: penaltyInfo.lateMinutes,
+        chargeable_late_minutes: penaltyInfo.chargeableLateMinutes,
+        late_penalty: penaltyInfo.penaltyAmount,
         note: locNote,
       },
       { merge: true }
@@ -2080,6 +2336,11 @@ export class CloudTelegramBot {
       ? `\n📍 Lokatsiya: <b>Do'konda (GPS tasdiqlandi: ${coords.dist}m)</b>`
       : '';
 
+    const privateCheckoutPenaltyLine =
+      this.latePenaltyEnabled && penaltyInfo.penaltyAmount > 0
+        ? `\n⚠️ Smena kechikish jarimasi: <b>${formatUzSum(penaltyInfo.penaltyAmount)}</b> (${penaltyInfo.lateMinutes} daq kechikish, ${penaltyInfo.chargeableLateMinutes} daq jarima)`
+        : '';
+
     await this.sendMessage(
       chatId,
       `🏁 <b>Ishdan ketganingiz qayd etildi!</b>\n\n` +
@@ -2087,26 +2348,217 @@ export class CloudTelegramBot {
         `🟢 Kelgan: <b>${activeShift.check_in_time.slice(0, 5)}</b> | 🔴 Ketgan: <b>${timeStr.slice(0, 5)}</b>\n` +
         `⏱ Ushbu smenada: <b>${formattedWorked}</b>${breakText}` +
         locTextForUser +
+        (!isGroup ? privateCheckoutPenaltyLine : '') +
         `\n\n` +
         `📊 <b>Bugun jami ishlangan:</b> <b>${formattedTodayTotal}</b>\n\n` +
-        `💡 <i>Agar bugun yana qaytib kelsangiz, istalgan vaqt '📍 Ishga keldim'ni bosishingiz mumkin!</i>`
+        `💡 <i>Agar bugun yana qaytib kelsangiz, istalgan vaqt '📍 Ishga keldim'ni bosishingiz mumkin!</i>`,
+      this.getMainKeyboard(isAdm)
     );
 
     const adminLocLine = coords
       ? `📍 Ketish masofasi: <b>Do'konda (${coords.dist} metr)</b>\n`
       : '';
 
-    await this.notifyAdmins(
+    const publicGroupNotify =
       `🔴 <b>Ishdan ketdi:</b> ${escapeHtml(user.full_name)}\n` +
-        `⏱ Smena: <b>${formattedWorked}</b>${breakText}\n` +
-        adminLocLine +
-        `📊 Bugungi jami: <b>${formattedTodayTotal}</b>`,
-      chatId
-    );
+      `⏱ Smena: <b>${formattedWorked}</b>${breakText}\n` +
+      adminLocLine +
+      `📊 Bugungi jami: <b>${formattedTodayTotal}</b>`;
+
+    const privateAdminNotify = publicGroupNotify + privateCheckoutPenaltyLine;
+
+    await this.notifyAdmins(publicGroupNotify, chatId, privateAdminNotify);
 
     // BARCHA ISHCHILAR ISHINI TUGATGANLIGINI TEKSHIRISH:
-    // Faqat barcha ishchilar ishni to'liq yakunlagandan keyingina avtomat kunlik yakuniy hisobot jo'natiladi!
     await this.checkAndTriggerDailyClosingReportIfAllFinished(todayStr);
+  }
+
+  // --- ⚠️ Kechikish va Jarimalar (Shaxsiy xodim uchun faqat o'ziniki, Admin uchun barchaniki!) ---
+  private async handleLatePenaltiesCommand(chatId: number, tgUserId: string, isAdm: boolean) {
+    const isGroup = chatId < 0;
+    // MAXFIYLIK HIMOYASI: Guruh chatda hech kimning jarimasi hammaga oshkor qilinmaydi!
+    if (isGroup) {
+      const botLink = this.botUsername
+        ? `https://t.me/${this.botUsername}?start=jarima`
+        : '';
+      await this.sendMessage(
+        chatId,
+        `🔒 <b>Maxfiylik himoyasi:</b>\n` +
+          `Kechikish jarimalari shaxsiy ma'lumot hisoblanadi va guruhda boshqa xodimlarga oshkor qilinmaydi.\n\n` +
+          `👉 Shaxsiy jarimalaringizni ko'rish uchun botning o'ziga yozing: ${this.botUsername ? `@${this.botUsername}` : 'Shaxsiy bot'}`,
+        botLink
+          ? {
+              inline_keyboard: [[{ text: '🔒 Shaxsiy Jarimalarimni Ko\'rish', url: botLink }]],
+            }
+          : undefined
+      );
+      return;
+    }
+
+    const tp = getTashkentParts();
+    const currentMonthPrefix = tp.monthPrefix;
+    const penaltySettings = this.getPenaltySettings();
+
+    if (isAdm) {
+      const usersSnap = await getDocs(collection(db, 'users'));
+      const workers: User[] = [];
+      usersSnap.forEach((d) => {
+        const u = d.data() as User;
+        if (u.role === 'worker' && u.is_active !== false) {
+          workers.push({ ...u, id: Number(u.id || d.id) });
+        }
+      });
+
+      const attSnap = await getDocs(collection(db, 'attendance'));
+      const shiftsByUserDate = new Map<string, Attendance[]>();
+      attSnap.forEach((d) => {
+        const a = d.data() as Attendance;
+        if (a.date && a.date.startsWith(currentMonthPrefix)) {
+          const key = `${a.user_id}_${a.date}`;
+          const list = shiftsByUserDate.get(key) || [];
+          list.push(a);
+          shiftsByUserDate.set(key, list);
+        }
+      });
+
+      let storeTotalPenalty = 0;
+      let text =
+        `⚠️ <b>${escapeHtml(this.shopName)} — KECHIKISH VA JARIMALAR NAZORATI (ADMIN)</b>\n` +
+        `🗓 Oy: <b>${String(tp.month).padStart(2, '0')}.${tp.year}</b>\n` +
+        `⚙️ Qoida: <b>${this.lateGracePeriodMinutes} daqiqa ruxsat</b> · Har bir oshgan daqiqa = <b>${formatUzSum(this.latePenaltyPerMinuteSum)}</b>\n` +
+        ` holati: <b>${this.latePenaltyEnabled ? 'Faol ✅' : "O'chiq ⏸"}</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      if (workers.length === 0) {
+        text += `<i>Hozircha faol ishchilar topilmadi.</i>`;
+      } else {
+        workers.forEach((w, idx) => {
+          let lateDays = 0;
+          let lateMinsTotal = 0;
+          let chargeableTotal = 0;
+          let penaltyTotal = 0;
+
+          shiftsByUserDate.forEach((shifts, key) => {
+            if (!key.startsWith(`${w.id}_`)) return;
+            shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+            const first = shifts[0];
+            if (first?.check_in_time) {
+              const res = calculateLatePenaltyAmount(
+                first.check_in_time,
+                w.work_start_time || '08:00',
+                1,
+                penaltySettings
+              );
+              if (res.lateMinutes > 0) {
+                lateDays += 1;
+                lateMinsTotal += res.lateMinutes;
+                chargeableTotal += res.chargeableLateMinutes;
+                penaltyTotal += res.penaltyAmount;
+              }
+            }
+          });
+
+          storeTotalPenalty += penaltyTotal;
+          text += `${idx + 1}. 👤 <b>${escapeHtml(w.full_name)}</b> (Reja: ${w.work_start_time || '08:00'})\n`;
+          if (lateDays === 0) {
+            text += `   ✅ Kechikish yo'q — <b>0 so'm</b>\n\n`;
+          } else {
+            text += `   • Kechikkan kunlar: <b>${lateDays} kun</b> (jami ${lateMinsTotal} daq, jarimali: ${chargeableTotal} daq)\n`;
+            text += `   • Hisoblangan jarima: <b>${formatUzSum(penaltyTotal)}</b>\n\n`;
+          }
+        });
+
+        text += `━━━━━━━━━━━━━━━━━━━\n`;
+        text += `💰 <b>Oy bo'yicha jami kechikish jarimalari:</b> <b>${formatUzSum(storeTotalPenalty)}</b>\n`;
+        text += `<i>⚙️ Ruxsat daqiqasi va summani Veb-Portal → Sozlamalar bo'limidan o'zgartirishingiz mumkin.</i>`;
+      }
+
+      await this.sendMessage(chatId, text);
+      return;
+    }
+
+    // Oddiy xodim (faqat o'zining shaxsiy jarimasini ko'radi!)
+    const user = await this.findUserByTelegramId(tgUserId);
+    if (!user) {
+      await this.sendMessage(chatId, `Iltimos, avval /start buyrug'ini bosing va ro'yxatdan o'ting.`);
+      return;
+    }
+
+    const attSnap = await getDocs(
+      query(collection(db, 'attendance'), where('user_id', '==', user.id))
+    );
+    const byDate = new Map<string, Attendance[]>();
+    attSnap.forEach((d) => {
+      const a = d.data() as Attendance;
+      if (a.date && a.date.startsWith(currentMonthPrefix)) {
+        const list = byDate.get(a.date) || [];
+        list.push(a);
+        byDate.set(a.date, list);
+      }
+    });
+
+    const lateItems: {
+      date: string;
+      inTime: string;
+      lateMins: number;
+      chargeableMins: number;
+      penalty: number;
+    }[] = [];
+    let totalChargeable = 0;
+    let totalPenalty = 0;
+
+    Array.from(byDate.keys())
+      .sort((a, b) => b.localeCompare(a))
+      .forEach((dateStr) => {
+        const shifts = byDate.get(dateStr) || [];
+        shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+        const first = shifts[0];
+        if (first?.check_in_time) {
+          const res = calculateLatePenaltyAmount(
+            first.check_in_time,
+            user.work_start_time || '08:00',
+            1,
+            penaltySettings
+          );
+          if (res.lateMinutes > 0) {
+            totalChargeable += res.chargeableLateMinutes;
+            totalPenalty += res.penaltyAmount;
+            lateItems.push({
+              date: dateStr,
+              inTime: first.check_in_time.slice(0, 5),
+              lateMins: res.lateMinutes,
+              chargeableMins: res.chargeableLateMinutes,
+              penalty: res.penaltyAmount,
+            });
+          }
+        }
+      });
+
+    let text =
+      `⚠️ <b>SHAXSIY KECHIKISH VA JARIMALAR HISOBI</b>\n` +
+      `👤 Xodim: <b>${escapeHtml(user.full_name)}</b>\n` +
+      `🗓 Oy: <b>${String(tp.month).padStart(2, '0')}.${tp.year}</b> | Ish boshlanishi: <b>${user.work_start_time || '08:00'}</b>\n` +
+      `📌 Tartib: <b>${this.lateGracePeriodMinutes} daqiqagacha ruxsat</b>, undan oshgan har 1 daqiqa uchun <b>${formatUzSum(this.latePenaltyPerMinuteSum)}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    if (!this.latePenaltyEnabled) {
+      text += `ℹ️ <i>Hozirda do'kon ma'muriyati tomonidan kechikish jarimasi o'chirib qo'yilgan.</i>`;
+    } else if (lateItems.length === 0) {
+      text += `✅ <b>Ushbu oyda sizda kechikish va jarimalar yo'q (0 so'm). Barakalla!</b>`;
+    } else {
+      text += `💰 <b>Jami hisoblangan jarima:</b> <b>${formatUzSum(totalPenalty)}</b> (${totalChargeable} daqiqa jarima)\n\n`;
+      text += `📅 <b>Kechikib kelingan kunlar (${lateItems.length} kun):</b>\n`;
+      lateItems.slice(0, 15).forEach((item) => {
+        const detail =
+          item.chargeableMins > 0
+            ? `<b>${formatUzSum(item.penalty)}</b> (${item.chargeableMins} daq jarima)`
+            : `0 so'm (${this.lateGracePeriodMinutes} daq ruxsat ichida)`;
+        text += `• ${item.date.slice(5)}: <b>${item.inTime}</b> (+${item.lateMins} daq) ➡️ ${detail}\n`;
+      });
+    }
+
+    text += `\n\n🔒 <i>Ushbu ma'lumot maxfiy: faqat sizga va do'kon ma'muriga ko'rinadi.</i>`;
+    await this.sendMessage(chatId, text);
   }
 
   // --- ⏱ Mening soatlarim ---
@@ -2119,6 +2571,7 @@ export class CloudTelegramBot {
 
     const tp = getTashkentParts();
     const currentMonthPrefix = tp.monthPrefix;
+    const isGroup = chatId < 0;
 
     const attRef = collection(db, 'attendance');
     const q = query(
@@ -2150,10 +2603,46 @@ export class CloudTelegramBot {
           : `\n<i>☕️ Hozir tanaffusdasiz</i>\n`;
     }
 
+    // Faqat shaxsiy chatda xodimning o'ziga oylik kechikish jarimasini ham ko'rsatamiz
+    let personalPenaltyLine = '';
+    if (!isGroup && this.latePenaltyEnabled) {
+      const byDate = new Map<string, Attendance[]>();
+      monthlyShifts.forEach((s) => {
+        const list = byDate.get(s.date) || [];
+        list.push(s);
+        byDate.set(s.date, list);
+      });
+      if (active && active.date.startsWith(currentMonthPrefix)) {
+        const list = byDate.get(active.date) || [];
+        list.push(active);
+        byDate.set(active.date, list);
+      }
+      let monthPenalty = 0;
+      let monthChargeableMins = 0;
+      byDate.forEach((shifts) => {
+        shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+        if (shifts[0]?.check_in_time) {
+          const pen = calculateLatePenaltyAmount(
+            shifts[0].check_in_time,
+            user.work_start_time || '08:00',
+            1,
+            this.getPenaltySettings()
+          );
+          monthPenalty += pen.penaltyAmount;
+          monthChargeableMins += pen.chargeableLateMinutes;
+        }
+      });
+      personalPenaltyLine =
+        monthPenalty > 0
+          ? `⚠️ Kechikish jarimasi (shaxsiy): <b>${formatUzSum(monthPenalty)}</b> (${monthChargeableMins} daq · batafsil: /jarima)\n`
+          : `✅ Kechikish jarimasi: <b>0 so'm</b>\n`;
+    }
+
     let text =
       `📊 <b>${escapeHtml(user.full_name)} ning oylik hisoboti (${String(tp.month).padStart(2, '0')}.${tp.year}):</b>\n\n` +
       `📅 Kelgan kunlar: <b>${uniqueDays} kun</b> (${monthlyShifts.length} ta smena)\n` +
       `⏱ <b>JAMI ISHLANGAN VAQT:</b> <b>${formatMinutes(totalMinutes)}</b> (${(totalMinutes / 60).toFixed(1)} soat)\n` +
+      personalPenaltyLine +
       statusLine;
 
     if (monthlyShifts.length > 0) {
@@ -2208,6 +2697,7 @@ export class CloudTelegramBot {
   private async handleAdminReport(chatId: number) {
     const tp = getTashkentParts();
     const currentMonthPrefix = tp.monthPrefix;
+    const isPrivateAdminChat = chatId > 0;
 
     const usersSnap = await getDocs(collection(db, 'users'));
     const workers: User[] = [];
@@ -2231,6 +2721,7 @@ export class CloudTelegramBot {
     });
 
     let totalStoreMinutes = 0;
+    let totalStorePenalty = 0;
     let text =
       `📋 <b>${escapeHtml(this.shopName)} XODIMLARINING OYLIK HISOBOTI</b>\n` +
       `🗓 Oy: <b>${String(tp.month).padStart(2, '0')}.${tp.year}</b>\n` +
@@ -2242,13 +2733,45 @@ export class CloudTelegramBot {
       const totalM = shifts.reduce((acc, s) => acc + getAccurateAttendanceMinutes(s), 0);
       totalStoreMinutes += totalM;
 
+      let workerPenalty = 0;
+      let workerLateDays = 0;
+      if (isPrivateAdminChat && this.latePenaltyEnabled) {
+        const byDate = new Map<string, Attendance[]>();
+        shifts.forEach((s) => {
+          const list = byDate.get(s.date) || [];
+          list.push(s);
+          byDate.set(s.date, list);
+        });
+        byDate.forEach((dayShifts) => {
+          dayShifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+          if (dayShifts[0]?.check_in_time) {
+            const pen = calculateLatePenaltyAmount(
+              dayShifts[0].check_in_time,
+              w.work_start_time || '08:00',
+              1,
+              this.getPenaltySettings()
+            );
+            if (pen.lateMinutes > 0) workerLateDays += 1;
+            workerPenalty += pen.penaltyAmount;
+          }
+        });
+        totalStorePenalty += workerPenalty;
+      }
+
       text += `👤 <b>${escapeHtml(w.full_name)}</b>\n`;
       text += `   • Ishlagan kunlari: <b>${days} kun</b> (${shifts.length} ta smena)\n`;
-      text += `   • Jami ishlagan vaqti: <b>${formatMinutes(totalM)}</b> (${(totalM / 60).toFixed(1)} soat)\n\n`;
+      text += `   • Jami ishlagan vaqti: <b>${formatMinutes(totalM)}</b> (${(totalM / 60).toFixed(1)} soat)\n`;
+      if (isPrivateAdminChat && this.latePenaltyEnabled) {
+        text += `   • Kechikish jarimasi: <b>${formatUzSum(workerPenalty)}</b> (${workerLateDays} kun kechikish)\n`;
+      }
+      text += `\n`;
     }
 
     text += `━━━━━━━━━━━━━━━━━━━\n`;
     text += `🏪 <b>Do'kon bo'yicha jami:</b> <b>${formatMinutes(totalStoreMinutes)}</b> (${(totalStoreMinutes / 60).toFixed(1)} soat)`;
+    if (isPrivateAdminChat && this.latePenaltyEnabled) {
+      text += `\n⚠️ <b>Jami kechikish jarimalari:</b> <b>${formatUzSum(totalStorePenalty)}</b>`;
+    }
 
     await this.sendMessage(chatId, text);
   }
@@ -2676,7 +3199,17 @@ export class CloudTelegramBot {
           }
         }
 
-        // 2. Kechki payt (Toshkent vaqti bilan 18:00 dan 23:59 gacha) har 2 daqiqada:
+        // 2. ☀️ Ertalabki uyg'otuvchi va ishga chaqiruvchi eslatma (Har bir xodimga smenasidan oldin)
+        if (this.morningWakeupEnabled && hour >= 6 && hour <= 14) {
+          await this.checkAndSendMorningWakeupReminders(tp);
+        }
+
+        // 2.5. 🚨 Kechikish ruxsati (grace period) tugaganda qat'iy shaxsiy ogohlantirish (Alarm)
+        if (this.latePenaltyEnabled && hour >= 6 && hour <= 23) {
+          await this.checkAndSendLateGraceExceededAlarms(tp);
+        }
+
+        // 3. Kechki payt (Toshkent vaqti bilan 18:00 dan 23:59 gacha) har 2 daqiqada:
         if (hour >= 18 && minute % 2 === 0) {
           await this.checkAndTriggerDailyClosingReportIfAllFinished(tp.dateStr);
         }
@@ -2684,6 +3217,179 @@ export class CloudTelegramBot {
         console.error('[CloudBot Cron Error]', err);
       }
     }, 30000);
+  }
+
+  // --- ☀️ ERTALABKI UYG'OTUVCHI VA ISHGA CHAQIRUVCHI ESLATMA ---
+  // Xodimning ish boshlanish vaqtidan (masalan: 08:00) 30 daqiqa oldin (07:30 da) shaxsiy Telegramiga xabar yuborish
+  public async checkAndSendMorningWakeupReminders(tp = getTashkentParts()): Promise<number> {
+    if (!this.morningWakeupEnabled || !this.botToken) return 0;
+    try {
+      const currentTotalMins = tp.hour * 60 + tp.minute;
+      const minutesBefore = this.morningWakeupMinutesBefore || 30;
+
+      // Bugun kelganlarni olish
+      const attSnap = await getDocs(
+        query(collection(db, 'attendance'), where('date', '==', tp.dateStr))
+      );
+      const checkedInUserIds = new Set<number>();
+      attSnap.forEach((d) => {
+        checkedInUserIds.add((d.data() as Attendance).user_id);
+      });
+
+      // Barcha faol xodimlarni olish
+      const userSnap = await getDocs(
+        query(collection(db, 'users'), where('role', '==', 'worker'))
+      );
+      let sentCount = 0;
+
+      for (const d of userSnap.docs) {
+        const u = d.data() as User;
+        if (u.is_active === false) continue;
+        if (!u.telegram_id) continue;
+        // Agar xodim bugun allaqachon kelgan bo'lsa, eslatma yuborilmaydi
+        if (checkedInUserIds.has(u.id)) continue;
+
+        const startTime = (u.work_start_time || '08:00').trim();
+        const [sH, sM] = startTime.split(':').map(Number);
+        if (isNaN(sH)) continue;
+        const startTotalMins = sH * 60 + (sM || 0);
+
+        // Eslatma yuborish vaqti = ish boshlanishidan `minutesBefore` daqiqa oldin
+        const targetReminderMin = startTotalMins - minutesBefore;
+        if (targetReminderMin < 0) continue;
+
+        // Aniq oraliq: hozirgi vaqt targetReminderMin dan targetReminderMin + 3 daqiqa ichida bo'lsa
+        const diff = currentTotalMins - targetReminderMin;
+        if (diff >= 0 && diff <= 3) {
+          const slotKey = `wakeup_${tp.dateStr}_${u.id}`;
+          const claimed = await this.claimRuntimeSlot(slotKey, 'sent');
+          if (!claimed) continue;
+
+          const customLine = this.morningWakeupCustomText
+            ? `\n💬 <i>${escapeHtml(this.morningWakeupCustomText)}</i>\n`
+            : '';
+
+          const graceLine = this.latePenaltyEnabled
+            ? `\n⚠️ <i>Eslatma: ${this.lateGracePeriodMinutes} daqiqadan oshgan har bir daqiqa kechikish uchun ${formatUzSum(this.latePenaltyPerMinuteSum)} jarima hisoblanadi.</i>`
+            : '';
+
+          const text =
+            `🌅 <b>XAYRLI TONG, ${escapeHtml(u.full_name)}!</b>\n\n` +
+            `⏰ <b>Smena boshlanishiga ${minutesBefore} daqiqa qoldi!</b>\n` +
+            `🏢 <b>Ish vaqtingiz:</b> <b>${startTime}</b> — ${u.work_end_time || '20:00'}\n` +
+            `📍 <b>Manzil:</b> ${escapeHtml(this.shopName)}\n` +
+            customLine +
+            `\nDo'konga yetib kelgach, botga kirib darhol <b>«📍 ISHGA KELDIM»</b> tugmasini bosishni unutmang!` +
+            graceLine;
+
+          const markup = {
+            inline_keyboard: [
+              [
+                { text: "🚶‍♂️ Yo'ldaman", callback_data: `wakeup_resp:on_way:${u.id}` },
+                { text: '⏰ Kechikaman', callback_data: `wakeup_resp:late:${u.id}` },
+              ],
+              [
+                { text: '📍 Ishga keldim', callback_data: 'quick_checkin' },
+                { text: '🌐 Veb-portal', url: this.webappUrl },
+              ],
+            ],
+          };
+
+          const res = await this.sendMessage(u.telegram_id, text, markup);
+          if (res.ok) {
+            sentCount++;
+            console.log(`[CloudBot Wakeup] Xodimga ertalabki eslatma yuborildi: ${u.full_name} (${u.telegram_id})`);
+          }
+        }
+      }
+
+      return sentCount;
+    } catch (err) {
+      console.error('[CloudBot Wakeup Error]', err);
+      return 0;
+    }
+  }
+
+  // --- 🚨 2-BOSQICHLI QAT'IY OGOHLANTIRISH (GRACE PERIOD TUGAGANDA ALARM) ---
+  // Smena boshlanish vaqti + grace period (masalan 10 daqiqa) tugaganda xodim hali kelmagan bo'lsa
+  public async checkAndSendLateGraceExceededAlarms(tp = getTashkentParts()): Promise<number> {
+    if (!this.latePenaltyEnabled || !this.botToken) return 0;
+    try {
+      const currentTotalMins = tp.hour * 60 + tp.minute;
+      const graceMinutes = this.lateGracePeriodMinutes || 10;
+
+      // Bugun kelganlarni olish
+      const attSnap = await getDocs(
+        query(collection(db, 'attendance'), where('date', '==', tp.dateStr))
+      );
+      const checkedInUserIds = new Set<number>();
+      attSnap.forEach((d) => {
+        checkedInUserIds.add((d.data() as Attendance).user_id);
+      });
+
+      // Barcha faol xodimlarni olish
+      const userSnap = await getDocs(
+        query(collection(db, 'users'), where('role', '==', 'worker'))
+      );
+      let sentCount = 0;
+
+      for (const d of userSnap.docs) {
+        const u = d.data() as User;
+        if (u.is_active === false) continue;
+        if (!u.telegram_id) continue;
+        // Agar xodim bugun allaqachon kelgan bo'lsa, ogohlantirish kerak emas
+        if (checkedInUserIds.has(u.id)) continue;
+
+        const startTime = (u.work_start_time || '08:00').trim();
+        const [sH, sM] = startTime.split(':').map(Number);
+        if (isNaN(sH)) continue;
+        const startTotalMins = sH * 60 + (sM || 0);
+
+        // Ruxsat tugash vaqti = ish boshlanishi + grace period
+        const graceEndMin = startTotalMins + graceMinutes;
+
+        // Aniq oraliq: hozirgi vaqt graceEndMin dan graceEndMin + 4 daqiqa ichida bo'lsa
+        const diff = currentTotalMins - graceEndMin;
+        if (diff >= 0 && diff <= 4) {
+          const slotKey = `grace_alarm_${tp.dateStr}_${u.id}`;
+          const claimed = await this.claimRuntimeSlot(slotKey, 'sent');
+          if (!claimed) continue;
+
+          const text =
+            `🚨 <b>DIQQAT, ${graceMinutes} DAQIQALIK RUXSAT TUGADI!</b>\n\n` +
+            `Hurmatli <b>${escapeHtml(u.full_name)}</b>, sizning ish vaqtingiz (<b>${startTime}</b>) boshlanganidan keyin berilgan <b>${graceMinutes} daqiqalik ruxsat</b> yakunlandi!\n\n` +
+            `⚠️ <b>Ayni paytda har bir kechikkan daqiqa uchun ${formatUzSum(this.latePenaltyPerMinuteSum)} miqdorida jarima yozilmoqda!</b>\n\n` +
+            `📍 Iltimos, do'konga yetib kelishingiz bilan botda zudlik bilan <b>«📍 ISHGA KELDIM»</b> tugmasini bosing!`;
+
+          const markup = {
+            inline_keyboard: [
+              [
+                { text: '📍 Ishga keldim', callback_data: 'quick_checkin' },
+                { text: '🌐 Veb-portal', url: this.webappUrl },
+              ],
+            ],
+          };
+
+          const res = await this.sendMessage(u.telegram_id, text, markup);
+          if (res.ok) {
+            sentCount++;
+            console.log(`[CloudBot Alarm] Xodimga ruxsat tugash alarmi yuborildi: ${u.full_name} (${u.telegram_id})`);
+          }
+
+          // Shaxsiy Adminga ham ogohlantirish yuborish (guruh chatiga jarima tafsilotlari oshkor qilinmaydi)
+          await this.notifyAdmins(
+            `⚠️ <b>Kechikish ogohlantiruvi:</b> ${escapeHtml(u.full_name)} smenasi (${startTime}) boshlandi va ${graceMinutes} daqiqalik ruxsat tugadi.`,
+            undefined,
+            `⚠️ <b>Kechikish alarmi:</b> <b>${escapeHtml(u.full_name)}</b> smenasi (${startTime}) boshlandi va <b>${graceMinutes} daqiqalik ruxsat tugadi</b>. Jarima hisoblanmoqda (${formatUzSum(this.latePenaltyPerMinuteSum)}/daq).`
+          );
+        }
+      }
+
+      return sentCount;
+    } catch (err) {
+      console.error('[CloudBot Grace Alarm Error]', err);
+      return 0;
+    }
   }
 
   // --- BARCHA ISHCHILAR ISHINI TUGATGANDAN KEYINGINA KUNLIK YAKUNIY HISOBOT ---
@@ -3077,6 +3783,7 @@ export class CloudTelegramBot {
       `☕️ <b>/tanaffus</b> — Tanaffusga chiqish\n` +
       `▶️ <b>/qaytdim</b> — Tanaffusdan qaytish\n` +
       `⏱ <b>/soat</b> — Oylik ishlagan soatlaringiz\n` +
+      `⚠️ <b>/jarima</b> — Shaxsiy kechikish va jarimalar hisobi\n` +
       `📅 <b>/oraliq</b> — Istalgan sana oralig'i hisoboti (masalan: <code>/oraliq 15.08 dan 18.09 gacha</code>)\n` +
       `📅 <b>/bugun</b> — Bugungi smenalaringiz\n` +
       `🏆 <b>/kpi</b> — Ishchilarning KPI va soat reytingi\n` +
@@ -3087,6 +3794,7 @@ export class CloudTelegramBot {
       text +=
         `\n👑 <b>Admin buyruqlari:</b>\n` +
         `🔴 <b>/live</b> — Hozir ishda kim borligini ko'rish\n` +
+        `⚠️ <b>/jarima</b> — Barcha xodimlarning kechikish va jarimalari\n` +
         `📊 <b>/hisobot</b> — Oylik umumiy hisobot\n` +
         `👥 <b>/ishchilar</b> — Xodimlar ro'yxati\n` +
         `📢 <b>/send6h</b> — 6 soatlik monitoring xulosasi\n` +
@@ -3099,11 +3807,39 @@ export class CloudTelegramBot {
 
   // --- Firestore Yordamchi Funksiyalari ---
   private async findUserByTelegramId(tgId: string): Promise<User | null> {
-    const q = query(collection(db, 'users'), where('telegram_id', '==', String(tgId)));
-    const snap = await getDocs(q);
-    if (snap.empty) return null;
-    const raw = snap.docs[0].data() as User;
-    return { ...raw, id: Number(raw.id || snap.docs[0].id) };
+    const cleanId = String(tgId || '').trim();
+    if (!cleanId) return null;
+
+    const pickBestProfile = (docs: any[]): User | null => {
+      if (!docs.length) return null;
+      const list = docs.map((d) => {
+        const raw = d.data() as User;
+        return { ...raw, id: Number(raw.id || d.id) };
+      });
+      // 1. Agar bir nechta profil topilsa, real faol ishchi (worker) profilini tanlaymiz
+      const activeWorker = list.find((u) => u.role === 'worker' && u.is_active !== false);
+      if (activeWorker) return activeWorker;
+      // 2. Faol profil
+      const activeUser = list.find((u) => u.is_active !== false);
+      if (activeUser) return activeUser;
+      return list[0];
+    };
+
+    const qStr = query(collection(db, 'users'), where('telegram_id', '==', cleanId));
+    const snapStr = await getDocs(qStr);
+    if (!snapStr.empty) {
+      return pickBestProfile(snapStr.docs);
+    }
+
+    if (/^\d+$/.test(cleanId)) {
+      const qNum = query(collection(db, 'users'), where('telegram_id', '==', Number(cleanId)));
+      const snapNum = await getDocs(qNum);
+      if (!snapNum.empty) {
+        return pickBestProfile(snapNum.docs);
+      }
+    }
+
+    return null;
   }
 
   private async findActiveShift(userId: number): Promise<Attendance | null> {

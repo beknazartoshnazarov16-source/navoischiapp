@@ -356,7 +356,8 @@ export function calculateMonthlyHours(
   users: User[],
   attendances: Attendance[],
   monthStr: string, // YYYY-MM
-  includeAllRoles: boolean = false
+  includeAllRoles: boolean = false,
+  settings?: Partial<MarketSettings>
 ): WorkerMonthlyHours[] {
   return users
     .filter((u) => includeAllRoles || u.role === 'worker')
@@ -374,6 +375,36 @@ export function calculateMonthlyHours(
         return acc + getAccurateAttendanceMinutes(curr);
       }, 0);
 
+      // Har bir kundagi 1-smena bo'yicha kechikish va jarimalarni hisoblash
+      const byDate = new Map<string, Attendance[]>();
+      userAttendances.forEach((a) => {
+        if ((a.date || '').slice(0, 7) !== monthStr) return;
+        const list = byDate.get(a.date) || [];
+        list.push(a);
+        byDate.set(a.date, list);
+      });
+
+      let lateDays = 0;
+      let totalLateMinutes = 0;
+      let totalLatePenalty = 0;
+      byDate.forEach((shifts) => {
+        shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+        const firstShift = shifts[0];
+        if (firstShift?.check_in_time) {
+          const pen = calculateLatePenaltyAmount(
+            firstShift.check_in_time,
+            user.work_start_time || '08:00',
+            1,
+            settings
+          );
+          if (pen.lateMinutes > 0) {
+            lateDays += 1;
+            totalLateMinutes += pen.lateMinutes;
+            totalLatePenalty += pen.penaltyAmount;
+          }
+        }
+      });
+
       const totalHours = Math.round((totalMinutes / 60) * 10) / 10;
       const avgMinutes = uniqueDays > 0 ? Math.round(totalMinutes / uniqueDays) : 0;
 
@@ -387,6 +418,9 @@ export function calculateMonthlyHours(
         total_worked_hours: totalHours,
         formatted_total_hours: formatMinutesToHours(totalMinutes),
         average_daily_minutes: avgMinutes,
+        late_days: lateDays,
+        total_late_minutes: totalLateMinutes,
+        total_late_penalty: totalLatePenalty,
       };
     });
 }
@@ -399,7 +433,8 @@ export function calculateHoursByDateRange(
   attendances: Attendance[],
   startDate: string, // YYYY-MM-DD
   endDate: string,   // YYYY-MM-DD
-  includeAllRoles: boolean = false
+  includeAllRoles: boolean = false,
+  settings?: Partial<MarketSettings>
 ): WorkerMonthlyHours[] {
   return users
     .filter((u) => includeAllRoles || u.role === 'worker')
@@ -417,6 +452,35 @@ export function calculateHoursByDateRange(
         return acc + getAccurateAttendanceMinutes(curr);
       }, 0);
 
+      const byDate = new Map<string, Attendance[]>();
+      userAttendances.forEach((a) => {
+        if (!a.date || a.date < startDate || a.date > endDate) return;
+        const list = byDate.get(a.date) || [];
+        list.push(a);
+        byDate.set(a.date, list);
+      });
+
+      let lateDays = 0;
+      let totalLateMinutes = 0;
+      let totalLatePenalty = 0;
+      byDate.forEach((shifts) => {
+        shifts.sort((a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || ''));
+        const firstShift = shifts[0];
+        if (firstShift?.check_in_time) {
+          const pen = calculateLatePenaltyAmount(
+            firstShift.check_in_time,
+            user.work_start_time || '08:00',
+            1,
+            settings
+          );
+          if (pen.lateMinutes > 0) {
+            lateDays += 1;
+            totalLateMinutes += pen.lateMinutes;
+            totalLatePenalty += pen.penaltyAmount;
+          }
+        }
+      });
+
       const totalHours = Math.round((totalMinutes / 60) * 10) / 10;
       const avgMinutes = uniqueDays > 0 ? Math.round(totalMinutes / uniqueDays) : 0;
 
@@ -430,6 +494,9 @@ export function calculateHoursByDateRange(
         total_worked_hours: totalHours,
         formatted_total_hours: formatMinutesToHours(totalMinutes),
         average_daily_minutes: avgMinutes,
+        late_days: lateDays,
+        total_late_minutes: totalLateMinutes,
+        total_late_penalty: totalLatePenalty,
       };
     });
 }
@@ -504,6 +571,34 @@ export function calculateShiftLateMinutes(
 ): number {
   if (shiftIndex > 1) return 0;
   return calculateLateMinutes(checkInTime, workStartTime);
+}
+
+export function calculateLatePenaltyAmount(
+  checkInTime: string,
+  workStartTime: string,
+  shiftIndex: number = 1,
+  settings?: Partial<MarketSettings>
+): { lateMinutes: number; chargeableLateMinutes: number; penaltyAmount: number } {
+  const lateMins = calculateShiftLateMinutes(checkInTime, workStartTime, shiftIndex);
+  if (settings && settings.late_penalty_enabled === false) {
+    return { lateMinutes: lateMins, chargeableLateMinutes: 0, penaltyAmount: 0 };
+  }
+  const grace =
+    settings && typeof settings.late_grace_period_minutes === 'number' && !isNaN(settings.late_grace_period_minutes)
+      ? Math.max(0, settings.late_grace_period_minutes)
+      : 10;
+  const rate =
+    settings && typeof settings.late_penalty_per_minute_sum === 'number' && !isNaN(settings.late_penalty_per_minute_sum)
+      ? Math.max(0, settings.late_penalty_per_minute_sum)
+      : 1000;
+
+  const chargeable = lateMins > grace ? lateMins - grace : 0;
+  const amount = chargeable * rate;
+  return {
+    lateMinutes: lateMins,
+    chargeableLateMinutes: chargeable,
+    penaltyAmount: amount,
+  };
 }
 
 /**

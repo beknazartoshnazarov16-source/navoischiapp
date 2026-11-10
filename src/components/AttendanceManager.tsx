@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { Attendance, User } from '../types';
+import { Attendance, MarketSettings, User } from '../types';
 import {
   calculateShiftWorkedMinutes,
-  calculateLateMinutes,
+  calculateLatePenaltyAmount,
   getAccurateAttendanceMinutes,
   formatMinutesToHours,
   formatUzDate,
+  formatUzSum,
   getLocalDateString,
 } from '../utils/calculations';
 import {
@@ -22,6 +23,7 @@ import {
 interface AttendanceManagerProps {
   users: User[];
   attendances: Attendance[];
+  settings?: MarketSettings;
   onAddAttendance: (att: Omit<Attendance, 'id'>) => void;
   onUpdateAttendance: (att: Attendance) => void;
   onDeleteAttendance: (id: number) => void;
@@ -30,6 +32,7 @@ interface AttendanceManagerProps {
 export function AttendanceManager({
   users,
   attendances,
+  settings,
   onAddAttendance,
   onUpdateAttendance,
   onDeleteAttendance,
@@ -107,6 +110,23 @@ export function AttendanceManager({
       formState.total_break_minutes
     );
 
+    const targetWorker = users.find((u) => u.id === Number(formState.user_id));
+    const existingSameDay = attendances.filter(
+      (a) => a.user_id === Number(formState.user_id) && a.date === formState.check_in_date
+    );
+    const simulatedShifts = [
+      ...existingSameDay.map((a) => ({ id: a.id, check_in_time: a.check_in_time || '' })),
+      { id: -1, check_in_time: formState.check_in_time },
+    ].sort((x, y) => x.check_in_time.localeCompare(y.check_in_time));
+    const shiftIdx = Math.max(1, simulatedShifts.findIndex((s) => s.id === -1) + 1);
+
+    const pen = calculateLatePenaltyAmount(
+      formState.check_in_time,
+      targetWorker?.work_start_time || '08:00',
+      shiftIdx,
+      settings
+    );
+
     onAddAttendance({
       user_id: Number(formState.user_id),
       date: formState.check_in_date,
@@ -115,6 +135,9 @@ export function AttendanceManager({
       check_out_time: formState.check_out_time,
       total_break_minutes: Number(formState.total_break_minutes) || 0,
       worked_minutes: workedMins,
+      late_minutes: pen.lateMinutes,
+      chargeable_late_minutes: pen.chargeableLateMinutes,
+      late_penalty: pen.penaltyAmount,
       status: 'completed',
       note: formState.note || undefined,
       created_at: new Date().toISOString(),
@@ -140,6 +163,26 @@ export function AttendanceManager({
       formState.total_break_minutes
     );
 
+    const targetWorker = users.find((u) => u.id === Number(formState.user_id));
+    const otherSameDay = attendances.filter(
+      (a) =>
+        a.user_id === Number(formState.user_id) &&
+        a.date === formState.check_in_date &&
+        a.id !== editingItem.id
+    );
+    const simulatedShifts = [
+      ...otherSameDay.map((a) => ({ id: a.id, check_in_time: a.check_in_time || '' })),
+      { id: editingItem.id, check_in_time: formState.check_in_time },
+    ].sort((x, y) => x.check_in_time.localeCompare(y.check_in_time));
+    const shiftIdx = Math.max(1, simulatedShifts.findIndex((s) => s.id === editingItem.id) + 1);
+
+    const pen = calculateLatePenaltyAmount(
+      formState.check_in_time,
+      targetWorker?.work_start_time || '08:00',
+      shiftIdx,
+      settings
+    );
+
     onUpdateAttendance({
       ...editingItem,
       user_id: Number(formState.user_id),
@@ -149,6 +192,9 @@ export function AttendanceManager({
       check_out_time: formState.check_out_time,
       total_break_minutes: Number(formState.total_break_minutes) || 0,
       worked_minutes: workedMins,
+      late_minutes: pen.lateMinutes,
+      chargeable_late_minutes: pen.chargeableLateMinutes,
+      late_penalty: pen.penaltyAmount,
       status: 'completed',
       note: formState.note || undefined,
     });
@@ -389,15 +435,24 @@ export function AttendanceManager({
                           if (shiftIdx > 1) {
                             return null;
                           }
-                          const lateMins = calculateLateMinutes(
-                            item.check_in_time ? item.check_in_time.slice(0, 5) : '',
-                            worker?.work_start_time || '08:00'
+                          const pen = calculateLatePenaltyAmount(
+                            item.check_in_time || '',
+                            worker?.work_start_time || '08:00',
+                            1,
+                            settings
                           );
-                          if (lateMins > 0) {
+                          if (pen.lateMinutes > 0) {
                             return (
-                              <span className="text-[9px] font-bold text-amber-700 bg-amber-100/80 px-1 py-0.5 rounded">
-                                +{lateMins}m
-                              </span>
+                              <>
+                                <span className="text-[9px] font-bold text-amber-700 bg-amber-100/80 px-1 py-0.5 rounded">
+                                  +{pen.lateMinutes}m
+                                </span>
+                                {settings?.late_penalty_enabled !== false && pen.penaltyAmount > 0 && (
+                                  <span className="text-[9px] font-bold text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded border border-rose-200">
+                                    -{formatUzSum(pen.penaltyAmount)}
+                                  </span>
+                                )}
+                              </>
                             );
                           }
                           return null;
@@ -522,15 +577,24 @@ export function AttendanceManager({
                                     if (shiftIdx > 1) {
                                       return null;
                                     }
-                                    const lateMins = calculateLateMinutes(
-                                      item.check_in_time ? item.check_in_time.slice(0, 5) : '',
-                                      worker?.work_start_time || '08:00'
+                                    const pen = calculateLatePenaltyAmount(
+                                      item.check_in_time || '',
+                                      worker?.work_start_time || '08:00',
+                                      1,
+                                      settings
                                     );
-                                    if (lateMins > 0) {
+                                    if (pen.lateMinutes > 0) {
                                       return (
-                                        <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 font-bold text-[10px] border border-amber-200">
-                                          +{lateMins} daq kechikkan
-                                        </span>
+                                        <>
+                                          <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 font-bold text-[10px] border border-amber-200">
+                                            +{pen.lateMinutes} daq kechikkan
+                                          </span>
+                                          {settings?.late_penalty_enabled !== false && pen.penaltyAmount > 0 && (
+                                            <span className="px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 font-bold text-[10px] border border-rose-200">
+                                              Jarima: -{formatUzSum(pen.penaltyAmount)}
+                                            </span>
+                                          )}
+                                        </>
                                       );
                                     }
                                     return null;
@@ -755,20 +819,44 @@ export function AttendanceManager({
                 </div>
               </div>
 
-              {/* Hisoblangan vaqtni oldindan ko'rsatish */}
-              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 flex items-center justify-between text-xs">
-                <span className="text-slate-600 font-medium">Jami hisoblanadigan vaqt:</span>
-                <span className="font-bold text-emerald-700 text-sm">
-                  {formatMinutesToHours(
-                    calculateShiftWorkedMinutes(
-                      formState.check_in_date,
-                      formState.check_in_time,
-                      formState.check_out_date,
-                      formState.check_out_time,
-                      formState.total_break_minutes
-                    )
-                  )}
-                </span>
+              {/* Hisoblangan vaqtni va kechikish jarimasini oldindan ko'rsatish */}
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600 font-medium">Jami hisoblanadigan vaqt:</span>
+                  <span className="font-bold text-emerald-700 text-sm">
+                    {formatMinutesToHours(
+                      calculateShiftWorkedMinutes(
+                        formState.check_in_date,
+                        formState.check_in_time,
+                        formState.check_out_date,
+                        formState.check_out_time,
+                        formState.total_break_minutes
+                      )
+                    )}
+                  </span>
+                </div>
+                {settings?.late_penalty_enabled !== false && (() => {
+                  const selectedW = users.find((u) => u.id === Number(formState.user_id));
+                  const previewPen = calculateLatePenaltyAmount(
+                    formState.check_in_time,
+                    selectedW?.work_start_time || '08:00',
+                    1,
+                    settings
+                  );
+                  if (previewPen.lateMinutes <= 0) return null;
+                  return (
+                    <div className="flex items-center justify-between pt-1.5 border-t border-slate-200">
+                      <span className="text-rose-700 font-medium">
+                        Kechikish ({previewPen.lateMinutes} daq):
+                      </span>
+                      <span className="font-bold text-rose-700">
+                        {previewPen.penaltyAmount > 0
+                          ? `-${formatUzSum(previewPen.penaltyAmount)} (${previewPen.chargeableLateMinutes} daq jarima)`
+                          : `0 so'm (${settings?.late_grace_period_minutes ?? 10} daq ruxsat ichida)`}
+                      </span>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div>

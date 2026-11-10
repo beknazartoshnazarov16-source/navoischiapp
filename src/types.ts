@@ -29,6 +29,9 @@ export interface Attendance {
   check_in_lon?: number;
   total_break_minutes: number;
   worked_minutes: number; // Jami ishlagan daqiqasi
+  late_minutes?: number; // Ishga kechikkan jami daqiqasi (1-smena)
+  chargeable_late_minutes?: number; // Ruxsat etilgan daqiqadan oshgan jarimali daqiqa
+  late_penalty?: number; // Hisoblangan kechikish jarimasi (so'm)
   status: AttendanceStatus;
   note?: string;
   created_at?: string;
@@ -105,6 +108,10 @@ export interface MarketSettings {
   reminder_daily_summary?: boolean;
   reminder_six_hours_enabled?: boolean;
   reminder_six_hours_last_sent?: string;
+  // Ertalabki uyg'otuvchi va ishga chaqiruvchi eslatma (Smena boshlanishidan oldin)
+  reminder_morning_wakeup_enabled?: boolean;             // Xodimga smenasidan oldin shaxsiy eslatma yuborish
+  reminder_morning_wakeup_minutes_before?: number;       // Smena boshlanishidan necha daqiqa oldin (masalan: 30 daqiqa)
+  reminder_morning_wakeup_custom_text?: string;          // Qo'shimcha maxsus xabar yoki dil so'zlari
   active_announcement?: StoreAnnouncement | null;
   // Geozona va Masofa bo'yicha Avtomatik ketish (100 metr uzoqlashganda)
   auto_checkout_on_distance_enabled?: boolean; // Do'kondan uzoqlashganda avtomatik ketishni qayd etish
@@ -116,6 +123,10 @@ export interface MarketSettings {
   salary_adjustments?: SalaryAdjustment[]; // Avanslar, mukofot va jarimalar
   payroll_payout_status?: Record<string, 'pending' | 'paid'>; // To'lov holati (masalan "2026-09_12": "paid")
   payroll_payout_records?: PayrollPayoutRecord[]; // To'langan maoshlar va oraliq kvitansiyalari tarixi
+  // Kechikish jarimasi sozlamalari
+  late_penalty_enabled?: boolean;              // Kechikish jarimasini avtomatik hisoblash
+  late_grace_period_minutes?: number;          // Ruxsat etilgan kechikish (daqiqa, standart: 10)
+  late_penalty_per_minute_sum?: number;        // Har bir kechikkan daqiqa uchun jarima summasi (so'm, standart: 1000)
 }
 
 export interface WorkerMonthlyHours {
@@ -128,4 +139,7 @@ export interface WorkerMonthlyHours {
   total_worked_hours: number; // Masalan 184.5
   formatted_total_hours: string; // Masalan "184 soat 30 daqiqa"
   average_daily_minutes: number;
+  late_days?: number;
+  total_late_minutes?: number;
+  total_late_penalty?: number;
 }

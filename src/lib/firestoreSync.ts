@@ -90,6 +90,12 @@ export function subscribeToAttendance(
           check_in_lon: data.check_in_lon,
           total_break_minutes: Number(data.total_break_minutes || 0),
           worked_minutes: Number(data.worked_minutes || 0),
+          late_minutes: data.late_minutes !== undefined && data.late_minutes !== null ? Number(data.late_minutes) : undefined,
+          chargeable_late_minutes:
+            data.chargeable_late_minutes !== undefined && data.chargeable_late_minutes !== null
+              ? Number(data.chargeable_late_minutes)
+              : undefined,
+          late_penalty: data.late_penalty !== undefined && data.late_penalty !== null ? Number(data.late_penalty) : undefined,
           status: data.status,
           note: data.note,
           created_at: data.created_at,
@@ -138,9 +144,11 @@ export function subscribeToSettings(
  */
 async function initializeDefaultData() {
   try {
-    const adminUser = INITIAL_USERS[0];
-    const userDocRef = doc(db, USERS_COLLECTION, String(adminUser.id));
-    await setDoc(userDocRef, cleanForFirestore(adminUser), { merge: true });
+    if (INITIAL_USERS.length > 0 && INITIAL_USERS[0]) {
+      const adminUser = INITIAL_USERS[0];
+      const userDocRef = doc(db, USERS_COLLECTION, String(adminUser.id));
+      await setDoc(userDocRef, cleanForFirestore(adminUser), { merge: true });
+    }
 
     const settingsRef = doc(db, SETTINGS_COLLECTION, SETTINGS_DOC_ID);
     await setDoc(settingsRef, cleanForFirestore(INITIAL_SETTINGS), { merge: true });

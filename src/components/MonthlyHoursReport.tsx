@@ -1,12 +1,14 @@
 import React, { useState, useMemo } from 'react';
-import { Attendance, User } from '../types';
+import { Attendance, MarketSettings, User } from '../types';
 import {
   calculateMonthlyHours,
   calculateHoursByDateRange,
+  calculateLatePenaltyAmount,
   getAccurateAttendanceMinutes,
   formatMinutesToHours,
   formatUzDate,
   formatUzMonth,
+  formatUzSum,
   getLocalMonthString,
   getLocalDateString,
 } from '../utils/calculations';
@@ -29,6 +31,7 @@ import {
 interface MonthlyHoursReportProps {
   users: User[];
   attendances: Attendance[];
+  settings?: MarketSettings;
   forWorkerId?: number;
   onNavigateToPayroll?: () => void;
 }
@@ -36,6 +39,7 @@ interface MonthlyHoursReportProps {
 export function MonthlyHoursReport({
   users,
   attendances,
+  settings,
   forWorkerId,
   onNavigateToPayroll,
 }: MonthlyHoursReportProps) {
@@ -94,11 +98,12 @@ export function MonthlyHoursReport({
         attendances,
         activePeriod.startDate,
         activePeriod.endDate,
-        isPersonalView
+        isPersonalView,
+        settings
       );
     }
-    return calculateMonthlyHours(targetUsers, attendances, selectedMonth, isPersonalView);
-  }, [periodMode, targetUsers, attendances, activePeriod, selectedMonth, isPersonalView]);
+    return calculateMonthlyHours(targetUsers, attendances, selectedMonth, isPersonalView, settings);
+  }, [periodMode, targetUsers, attendances, activePeriod, selectedMonth, isPersonalView, settings]);
 
   // Umumiy do'kon boyicha jami soatlar
   const totalStoreMinutes = monthlyData.reduce(
@@ -111,7 +116,11 @@ export function MonthlyHoursReport({
     monthlyData.forEach((w, idx) => {
       text += `${idx + 1}. ${w.full_name} (${w.position})\n`;
       text += `   • Kelgan kunlari: ${w.worked_days} kun\n`;
-      text += `   • Jami ishlagan vaqti: ${w.formatted_total_hours} (${w.total_worked_hours} soat)\n\n`;
+      text += `   • Jami ishlagan vaqti: ${w.formatted_total_hours} (${w.total_worked_hours} soat)\n`;
+      if (settings?.late_penalty_enabled !== false) {
+        text += `   • Kechikish jarimasi: ${formatUzSum(w.total_late_penalty || 0)} (${w.total_late_minutes || 0} daq)\n`;
+      }
+      text += `\n`;
     });
     text += `Umumiy do'kon soatlari: ${formatMinutesToHours(totalStoreMinutes)}`;
 
@@ -122,9 +131,9 @@ export function MonthlyHoursReport({
 
   const handleDownloadCSV = () => {
     let csvContent = 'data:text/csv;charset=utf-8,\uFEFF';
-    csvContent += 'T/r;Xodim;Lavozimi;Telefon;Kelgan kunlari;Jami ishlagan vaqti;Jami soat\n';
+    csvContent += 'T/r;Xodim;Lavozimi;Telefon;Kelgan kunlari;Jami ishlagan vaqti;Jami soat;Kechikkan daqiqa;Kechikish jarimasi (som)\n';
     monthlyData.forEach((w, idx) => {
-      csvContent += `${idx + 1};"${w.full_name}";"${w.position}";"${w.phone}";${w.worked_days};"${w.formatted_total_hours}";${w.total_worked_hours}\n`;
+      csvContent += `${idx + 1};"${w.full_name}";"${w.position}";"${w.phone}";${w.worked_days};"${w.formatted_total_hours}";${w.total_worked_hours};${w.total_late_minutes || 0};${w.total_late_penalty || 0}\n`;
     });
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
@@ -506,6 +515,35 @@ export function MonthlyHoursReport({
                       )}
                     </div>
 
+                    {/* Kechikish va Jarima ko'rsatkichi */}
+                    {settings?.late_penalty_enabled !== false && (
+                      <div className="text-left sm:text-right min-w-[100px]">
+                        <div className="text-[10px] sm:text-xs text-slate-400 font-medium">Kechikish jarimasi</div>
+                        {(workerData.total_late_penalty || 0) > 0 ? (
+                          <>
+                            <div className="text-xs sm:text-sm font-black text-rose-600">
+                              -{formatUzSum(workerData.total_late_penalty || 0)}
+                            </div>
+                            <div className="text-[10px] text-rose-500 font-medium">
+                              {workerData.late_days || 0} kun ({workerData.total_late_minutes || 0} daq)
+                            </div>
+                          </>
+                        ) : (workerData.total_late_minutes || 0) > 0 ? (
+                          <>
+                            <div className="text-xs sm:text-sm font-bold text-amber-600">0 so'm</div>
+                            <div className="text-[10px] text-amber-600">
+                              {workerData.total_late_minutes} daq (ruxsat ichida)
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="text-xs sm:text-sm font-bold text-emerald-600">0 so'm</div>
+                            <div className="text-[10px] text-slate-400">Kechikmagan</div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
                     {/* JAMI ISHLAGAN SOATI */}
                     <div className="text-right min-w-[110px] sm:min-w-[130px]">
                       <div className="text-[10px] sm:text-xs text-slate-400 font-medium">JAMI ISH VAQTI</div>
@@ -559,26 +597,45 @@ export function MonthlyHoursReport({
                         {/* Mobil ko'rinish (sm:hidden) */}
                         <div className="sm:hidden space-y-2">
                           {workerShifts.map((shift) => {
+                            const workerObj = users.find((u) => u.id === shift.user_id);
                             const sameDateShifts = workerShifts
                               .filter((s) => s.date === shift.date)
                               .sort((a, b) => a.check_in_time.localeCompare(b.check_in_time));
                             const shiftIdx = sameDateShifts.findIndex((s) => s.id === shift.id) + 1;
                             const isMulti = sameDateShifts.length > 1;
+                            const pen = calculateLatePenaltyAmount(
+                              shift.check_in_time || '',
+                              workerObj?.work_start_time || '08:00',
+                              shiftIdx,
+                              settings
+                            );
 
                             return (
                               <div
                                 key={`mob-shift-${shift.id}`}
                                 className="bg-white p-3 rounded-xl border border-slate-200 text-xs shadow-2xs space-y-1.5"
                               >
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between gap-2 flex-wrap">
                                   <span className="font-semibold text-slate-900">
                                     {formatUzDate(shift.date)}
                                   </span>
-                                  {isMulti && (
-                                    <span className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[10px] font-bold">
-                                      {shiftIdx}-smena
-                                    </span>
-                                  )}
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    {isMulti && (
+                                      <span className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[10px] font-bold">
+                                        {shiftIdx}-smena
+                                      </span>
+                                    )}
+                                    {shiftIdx === 1 && pen.lateMinutes > 0 && (
+                                      <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[10px] font-bold border border-amber-200">
+                                        +{pen.lateMinutes} daq
+                                      </span>
+                                    )}
+                                    {shiftIdx === 1 && settings?.late_penalty_enabled !== false && pen.penaltyAmount > 0 && (
+                                      <span className="px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 text-[10px] font-bold border border-rose-200">
+                                        -{formatUzSum(pen.penaltyAmount)}
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                                 <div className="flex items-center justify-between text-[11px] text-slate-600 bg-slate-50 p-2 rounded-lg">
                                   <div>
@@ -603,16 +660,26 @@ export function MonthlyHoursReport({
                                 <th className="py-2.5 px-3">Sana</th>
                                 <th className="py-2.5 px-3">Kelgan vaqti</th>
                                 <th className="py-2.5 px-3">Ketgan vaqti</th>
+                                {settings?.late_penalty_enabled !== false && (
+                                  <th className="py-2.5 px-3">Kechikish / Jarima</th>
+                                )}
                                 <th className="py-2.5 px-3 text-right">Kunlik ishlangan vaqt</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                               {workerShifts.map((shift) => {
+                                const workerObj = users.find((u) => u.id === shift.user_id);
                                 const sameDateShifts = workerShifts
                                   .filter((s) => s.date === shift.date)
                                   .sort((a, b) => a.check_in_time.localeCompare(b.check_in_time));
                                 const shiftIdx = sameDateShifts.findIndex((s) => s.id === shift.id) + 1;
                                 const isMulti = sameDateShifts.length > 1;
+                                const pen = calculateLatePenaltyAmount(
+                                  shift.check_in_time || '',
+                                  workerObj?.work_start_time || '08:00',
+                                  shiftIdx,
+                                  settings
+                                );
 
                                 return (
                                   <tr key={shift.id} className="hover:bg-slate-50">
@@ -637,6 +704,23 @@ export function MonthlyHoursReport({
                                         </span>
                                       )}
                                     </td>
+                                    {settings?.late_penalty_enabled !== false && (
+                                      <td className="py-2.5 px-3">
+                                        {shiftIdx > 1 ? (
+                                          <span className="text-[10px] text-slate-400">Qayta kirish</span>
+                                        ) : pen.penaltyAmount > 0 ? (
+                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 font-bold text-[11px] border border-rose-200">
+                                            -{formatUzSum(pen.penaltyAmount)} ({pen.lateMinutes} daq)
+                                          </span>
+                                        ) : pen.lateMinutes > 0 ? (
+                                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 font-semibold text-[11px]">
+                                            {pen.lateMinutes} daq (ruxsat ichida)
+                                          </span>
+                                        ) : (
+                                          <span className="text-[11px] text-emerald-600 font-medium">✓ O'z vaqtida</span>
+                                        )}
+                                      </td>
+                                    )}
                                     <td className="py-2.5 px-3 text-right font-bold text-slate-900">
                                       {formatMinutesToHours(getAccurateAttendanceMinutes(shift))}
                                     </td>
