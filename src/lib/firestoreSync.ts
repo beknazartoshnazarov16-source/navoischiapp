@@ -99,6 +99,17 @@ export function subscribeToAttendance(
           status: data.status,
           note: data.note,
           created_at: data.created_at,
+          auto_checkout_reminded_at: data.auto_checkout_reminded_at || undefined,
+          auto_checkout_extend_count:
+            data.auto_checkout_extend_count !== undefined && data.auto_checkout_extend_count !== null
+              ? Number(data.auto_checkout_extend_count)
+              : undefined,
+          auto_checkout_extended_until_ms:
+            data.auto_checkout_extended_until_ms !== undefined && data.auto_checkout_extended_until_ms !== null
+              ? Number(data.auto_checkout_extended_until_ms)
+              : undefined,
+          auto_checkout_source: data.auto_checkout_source || undefined,
+          needs_admin_review: Boolean(data.needs_admin_review),
         });
       });
       // Eng yangi davomat yuqorida turishi uchun

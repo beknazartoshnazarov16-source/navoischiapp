@@ -38,7 +38,12 @@
         "worked_minutes": { "type": "number" },
         "status": { "type": "string" },
         "note": { "type": "string" },
-        "created_at": { "type": "string" }
+        "created_at": { "type": "string" },
+        "auto_checkout_reminded_at": { "type": "string" },
+        "auto_checkout_extend_count": { "type": "number" },
+        "auto_checkout_extended_until_ms": { "type": "number" },
+        "auto_checkout_source": { "type": "string" },
+        "needs_admin_review": { "type": "boolean" }
       },
       "required": ["id", "user_id", "date", "status"]
     },
@@ -53,6 +58,12 @@
         "market_latitude": { "type": "number" },
         "market_longitude": { "type": "number" },
         "gps_radius_meters": { "type": "number" },
+        "auto_checkout_on_distance_enabled": { "type": "boolean" },
+        "auto_checkout_distance_meters": { "type": "number" },
+        "live_location_auto_checkout_enabled": { "type": "boolean" },
+        "auto_checkout_reminder_enabled": { "type": "boolean" },
+        "auto_checkout_reminder_delay_minutes": { "type": "number" },
+        "auto_checkout_grace_after_reminder_minutes": { "type": "number" },
         "bot_token": { "type": "string" },
         "admin_telegram_id": { "type": "string" },
         "admin_pin": { "type": "string" },

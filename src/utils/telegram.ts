@@ -75,13 +75,19 @@ export const triggerHaptic = (
   type: 'light' | 'medium' | 'heavy' | 'success' | 'warning' | 'error' = 'light'
 ) => {
   try {
-    const haptic = window.Telegram?.WebApp?.HapticFeedback;
-    if (!haptic) return;
+    const tg = window.Telegram?.WebApp;
+    const haptic = tg?.HapticFeedback;
+    if (!tg || !haptic) return;
+    // Oddiy brauzerda yoki Telegram WebApp 6.0 da HapticFeedback qo'llab-quvvatlanmaydi (6.1+ talab qilinadi)
+    if (!tg.initData) return;
+    if (typeof tg.isVersionAtLeast === 'function' && !tg.isVersionAtLeast('6.1')) {
+      return;
+    }
 
     if (type === 'success' || type === 'warning' || type === 'error') {
-      haptic.notificationOccurred(type);
+      haptic.notificationOccurred?.(type);
     } else {
-      haptic.impactOccurred(type);
+      haptic.impactOccurred?.(type);
     }
   } catch {
     // Brauzerda xatolik bermasligi uchun

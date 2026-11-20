@@ -35,6 +35,11 @@ export interface Attendance {
   status: AttendanceStatus;
   note?: string;
   created_at?: string;
+  auto_checkout_reminded_at?: string;
+  auto_checkout_extend_count?: number;
+  auto_checkout_extended_until_ms?: number;
+  auto_checkout_source?: 'live_location' | 'schedule' | 'worker_button' | 'geofence';
+  needs_admin_review?: boolean;
 }
 
 export interface AdminMember {
@@ -113,9 +118,13 @@ export interface MarketSettings {
   reminder_morning_wakeup_minutes_before?: number;       // Smena boshlanishidan necha daqiqa oldin (masalan: 30 daqiqa)
   reminder_morning_wakeup_custom_text?: string;          // Qo'shimcha maxsus xabar yoki dil so'zlari
   active_announcement?: StoreAnnouncement | null;
-  // Geozona va Masofa bo'yicha Avtomatik ketish (100 metr uzoqlashganda)
-  auto_checkout_on_distance_enabled?: boolean; // Do'kondan uzoqlashganda avtomatik ketishni qayd etish
-  auto_checkout_distance_meters?: number;      // Necha metr uzoqlashganda (standart: 100 metr)
+  // Geozona, Live Location va Jadval bo'yicha Avtomatik ketish
+  auto_checkout_on_distance_enabled?: boolean;           // Do'kondan uzoqlashganda avtomatik ketishni qayd etish
+  auto_checkout_distance_meters?: number;                // Necha metr uzoqlashganda (standart: 100 metr)
+  live_location_auto_checkout_enabled?: boolean;         // Telegram Jonli joylashuv (Live Location) orqali fonda avto-ketish
+  auto_checkout_reminder_enabled?: boolean;              // Ish vaqti tugaganda botdan eslatma yuborish va javob bermasa avto-yopish
+  auto_checkout_reminder_delay_minutes?: number;         // Smena tugagandan necha daqiqa o'tib eslatma yuborish (standart: 10)
+  auto_checkout_grace_after_reminder_minutes?: number;   // Eslatmadan keyin javob bermasa necha daqiqada avto-yopish (standart: 30)
   // Oylik va Ish haqi (Buxgalteriya) sozlamalari - FAQAT 1 NAZORATCHI ADMIN UCHUN
   payroll_admin_id?: string;               // Faqat ushbu yagona Bosh Admin ko'ra oladi
   payroll_master_pin?: string;             // Maxfiy Oylik PIN kodi (boshlang'ich: "9009")

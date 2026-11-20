@@ -664,8 +664,102 @@ export function SettingsManager({
                   <span>300 m</span>
                 </div>
               </div>
+
+              <div className="pt-2 border-t border-amber-100 dark:border-amber-800/60 flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-bold text-slate-800 dark:text-slate-200">
+                    1-yo'l: Telegram «Jonli joylashuv» (fonda 100% kuzatish)
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Ishchi botga Jonli joylashuv ulashsa, Mini Appni ochmasdan do'kondan uzoqlashganda ham bot avtomatik chiqaradi.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={formData.live_location_auto_checkout_enabled !== false}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      live_location_auto_checkout_enabled: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 accent-amber-500 cursor-pointer shrink-0"
+                />
+              </div>
             </div>
           )}
+
+          {/* 2-yo'l: Ish vaqti tugaganda Aqlli Eslatma + Avtomatik Yopish */}
+          <div className="p-3.5 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-amber-200/80 dark:border-amber-800/80 space-y-3 text-xs">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                  <span>2-yo'l: Ish vaqti tugaganda aqlli eslatma va avto-yopish</span>
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-200 text-[10px] font-bold">
+                    {formData.auto_checkout_reminder_enabled !== false ? 'Faol' : "O'chiq"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                  Smena tugaganda bot xodimga tugmali eslatma yuboradi. Javob bermasa tizim reja bo'yicha o'zi yopadi va Adminga xabar beradi.
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={formData.auto_checkout_reminder_enabled !== false}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    auto_checkout_reminder_enabled: e.target.checked,
+                  })
+                }
+                className="w-4 h-4 accent-amber-500 cursor-pointer shrink-0"
+              />
+            </div>
+
+            {formData.auto_checkout_reminder_enabled !== false && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-amber-100 dark:border-amber-800/60">
+                <div className="space-y-1">
+                  <label className="block font-bold text-slate-700 dark:text-slate-300">
+                    Smena tugagandan necha daqiqa o'tib eslatilsin:
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="180"
+                    value={formData.auto_checkout_reminder_delay_minutes ?? 10}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        auto_checkout_reminder_delay_minutes: Math.max(1, parseInt(e.target.value, 10) || 10),
+                      })
+                    }
+                    className="w-full px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg font-bold text-slate-900 dark:text-white font-mono"
+                  />
+                  <p className="text-[10px] text-slate-500">Standart: 10 daqiqa (20:00 smena uchun 20:10 da).</p>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-bold text-slate-700 dark:text-slate-300">
+                    Javob bermasa necha daqiqada avto-yopilsin:
+                  </label>
+                  <input
+                    type="number"
+                    min="5"
+                    max="180"
+                    value={formData.auto_checkout_grace_after_reminder_minutes ?? 30}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        auto_checkout_grace_after_reminder_minutes: Math.max(5, parseInt(e.target.value, 10) || 30),
+                      })
+                    }
+                    className="w-full px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg font-bold text-slate-900 dark:text-white font-mono"
+                  />
+                  <p className="text-[10px] text-slate-500">Standart: 30 daqiqa kutadi, keyin reja vaqti bilan yopadi.</p>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Kechikish va Jarima Sozlamalari (Yangi) */}

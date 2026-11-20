@@ -197,6 +197,7 @@ export function AttendanceManager({
       late_penalty: pen.penaltyAmount,
       status: 'completed',
       note: formState.note || undefined,
+      needs_admin_review: false,
     });
 
     setEditingItem(null);
@@ -655,10 +656,31 @@ export function AttendanceManager({
                         {/* Holati */}
                         <td className="py-3 px-4">
                           {item.status === 'completed' ? (
-                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-800">
-                              <CheckCircle2 className="w-3 h-3" />
-                              Yakunlangan
-                            </span>
+                            <div className="flex flex-col items-start gap-1">
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-800">
+                                <CheckCircle2 className="w-3 h-3" />
+                                Yakunlangan
+                              </span>
+                              {item.needs_admin_review && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onUpdateAttendance({
+                                      ...item,
+                                      needs_admin_review: false,
+                                      note: item.note?.includes('Admin tasdiqladi')
+                                        ? item.note
+                                        : `${item.note || 'Avtomatik yopilgan'} (✅ Admin tasdiqladi)`,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 hover:bg-amber-200 transition cursor-pointer"
+                                  title="Avtomatik yopilgan vaqtni tasdiqlash"
+                                >
+                                  <AlertTriangle className="w-2.5 h-2.5" />
+                                  Avto-yopilgan · Tasdiqlash
+                                </button>
+                              )}
+                            </div>
                           ) : (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800">
                               <Clock className="w-3 h-3" />

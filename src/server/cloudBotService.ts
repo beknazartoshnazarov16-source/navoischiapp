@@ -28,6 +28,7 @@ import {
   haversineDistanceMeters,
   calculateLatePenaltyAmount,
   formatUzSum,
+  getScheduledShiftEndInfo,
 } from '../utils/calculations.ts';
 
 // O'zbekiston (Toshkent UTC+5, yozgi vaqt o'zgarishi yo'q) uchun 100% aniq vaqt qismlari
@@ -124,8 +125,8 @@ export class CloudTelegramBot {
   private consecutiveErrors = 0;
   private instanceId = `srv_${process.pid}_${Math.random().toString(36).substring(2, 8)}`;
   private bootTime = Date.now();
-  // Yangilangan barqaror versiya (500) har qanday eski qolib ketgan serverlardan ustun keladi va pollingni darhol oladi
-  private leaderPriority = 500;
+  // Yangilangan barqaror versiya (501) har qanday eski qolib ketgan serverlardan ustun keladi va pollingni darhol oladi
+  private leaderPriority = 501;
   private isLeader = false;
   private lastLeaderCheck = 0;
   private observedLeaderId: string | null = null;
@@ -158,9 +159,33 @@ export class CloudTelegramBot {
   private morningWakeupEnabled = true;
   private morningWakeupMinutesBefore = 30;
   private morningWakeupCustomText = '';
+  // Geozona, Live Location va Jadval bo'yicha Avtomatik ketish sozlamalari
+  private autoCheckoutOnDistanceEnabled = true;
+  private autoCheckoutDistanceMeters = 100;
+  private liveLocationAutoCheckoutEnabled = true;
+  private autoCheckoutReminderEnabled = true;
+  private autoCheckoutReminderDelayMinutes = 10;
+  private autoCheckoutGraceAfterReminderMinutes = 30;
   private pendingLocationUsers = new Map<string, { chatId: number; isAdm: boolean; isGroup: boolean; timestamp: number }>();
   private pendingCheckoutLocationUsers = new Map<string, { chatId: number; isAdm: boolean; isGroup: boolean; timestamp: number }>();
   private pendingDateRangeUsers = new Set<string>();
+  // Jonli joylashuv (Live Location) kuzatuv sessiyalari (telegram_id -> holat)
+  private liveLocationSessions = new Map<
+    string,
+    {
+      userId: number;
+      attendanceId: number;
+      tgUserId: string;
+      chatId: number;
+      messageId: number;
+      startedAtMs: number;
+      expiresAtMs: number;
+      outOfBoundsCount: number;
+      firstOutOfBoundsMs: number;
+      lastDistMeters: number;
+      lastUpdatedMs: number;
+    }
+  >();
 
   constructor() {
     this.botToken = (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
@@ -265,7 +290,7 @@ export class CloudTelegramBot {
         body: JSON.stringify({
           url: finalUrl,
           drop_pending_updates: true,
-          allowed_updates: ['message', 'callback_query'],
+          allowed_updates: ['message', 'edited_message', 'callback_query', 'channel_post'],
         }),
       });
       const data = await res.json();
@@ -406,6 +431,23 @@ export class CloudTelegramBot {
         ? Math.max(5, Math.min(180, data.reminder_morning_wakeup_minutes_before))
         : 30;
     this.morningWakeupCustomText = String(data.reminder_morning_wakeup_custom_text || '').trim();
+
+    // Geozona, Live Location va Avto-yopish sozlamalari
+    this.autoCheckoutOnDistanceEnabled = data.auto_checkout_on_distance_enabled !== false;
+    this.autoCheckoutDistanceMeters =
+      typeof data.auto_checkout_distance_meters === 'number' && !isNaN(data.auto_checkout_distance_meters)
+        ? Math.max(30, Math.min(500, data.auto_checkout_distance_meters))
+        : 100;
+    this.liveLocationAutoCheckoutEnabled = data.live_location_auto_checkout_enabled !== false;
+    this.autoCheckoutReminderEnabled = data.auto_checkout_reminder_enabled !== false;
+    this.autoCheckoutReminderDelayMinutes =
+      typeof data.auto_checkout_reminder_delay_minutes === 'number' && !isNaN(data.auto_checkout_reminder_delay_minutes)
+        ? Math.max(1, Math.min(180, data.auto_checkout_reminder_delay_minutes))
+        : 10;
+    this.autoCheckoutGraceAfterReminderMinutes =
+      typeof data.auto_checkout_grace_after_reminder_minutes === 'number' && !isNaN(data.auto_checkout_grace_after_reminder_minutes)
+        ? Math.max(5, Math.min(180, data.auto_checkout_grace_after_reminder_minutes))
+        : 30;
 
     return { tokenChanged };
   }
@@ -669,17 +711,45 @@ export class CloudTelegramBot {
     } catch {}
   }
 
-  // Har bir xabar yoki callback_query faqat va faqat 1 marta qayta ishlanishini ta'minlovchi tezkor xotira blokirovkasi
-  private claimDistributedMessageLock(lockKey: string): boolean {
-    if (this.processedMessageIds.has(lockKey)) {
+  // Har bir xabar yoki callback_query faqat va faqat 1 marta qayta ishlanishini ta'minlovchi
+  // xotira + atomik Firestore tarqatilgan qulfi (2 ta server ham 1 ta xabarga hech qachon 2 marta javob bermaydi)
+  private async claimDistributedMessageLock(lockKey: string, persistInFirestore = true): Promise<boolean> {
+    const safeKey = lockKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (this.processedMessageIds.has(safeKey)) {
       return false;
     }
-    this.processedMessageIds.add(lockKey);
+    this.processedMessageIds.add(safeKey);
     if (this.processedMessageIds.size > 5000) {
       const first = this.processedMessageIds.values().next().value;
       if (first) this.processedMessageIds.delete(first);
     }
-    return true;
+
+    if (!persistInFirestore) {
+      return true;
+    }
+
+    try {
+      const lockRef = doc(db, 'bot_locks', safeKey);
+      const won = await Promise.race([
+        runTransaction(db, async (tx) => {
+          const snap = await tx.get(lockRef);
+          if (snap.exists()) {
+            return false;
+          }
+          tx.set(lockRef, {
+            instance_id: this.instanceId,
+            created_at_ms: Date.now(),
+            created_at: new Date().toISOString(),
+          });
+          return true;
+        }),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 2500)),
+      ]);
+      return won;
+    } catch (err) {
+      console.warn(`[CloudBot Lock] ${safeKey} tekshirishda ogohlantirish:`, err);
+      return true;
+    }
   }
 
   private restartPolling() {
@@ -756,8 +826,26 @@ export class CloudTelegramBot {
         const data = await res.json();
         if (data.ok && Array.isArray(data.result)) {
           this.consecutiveErrors = 0;
+          if (data.result.length > 0) {
+            const lastUpdate = data.result[data.result.length - 1];
+            const nextOffset = Number(lastUpdate?.update_id || 0) + 1;
+            if (nextOffset > this.currentOffset) {
+              this.currentOffset = nextOffset;
+            }
+            // Yangi offsetni darhol bazaga yozib qo'yamiz (server almashganda eski xabar qayta o'qilmasligi uchun)
+            const nowHb = Date.now();
+            setDoc(
+              doc(db, 'settings', 'bot_leader'),
+              {
+                last_offset: this.currentOffset,
+                heartbeat: nowHb,
+                last_heartbeat: nowHb,
+              },
+              { merge: true }
+            ).catch(() => {});
+          }
           for (const update of data.result) {
-            this.currentOffset = update.update_id + 1;
+            this.currentOffset = Math.max(this.currentOffset, update.update_id + 1);
             if (this.processedUpdateIds.has(update.update_id)) {
               continue;
             }
@@ -969,11 +1057,16 @@ export class CloudTelegramBot {
   ): Promise<{ ok: boolean; newChatId?: string; error?: string }> {
     if (!this.botToken) return { ok: false, error: 'Token mavjud emas' };
 
-    // Aynan bir lahzada (1.2 soniya ichida) 2 marta bir xil xabar ketib qolishini to'xtatish
-    const dedupeKey = `${chatId}_${text.slice(0, 120).trim()}`;
+    // Aynan bir lahzada (2 soniya ichida) 2 marta bir xil xabar ketib qolishini darhol to'xtatish (race-free)
+    const dedupeKey = `${chatId}_${text.length}_${text.slice(0, 200).trim()}`;
     const lastSent = this.recentSentMessageCache.get(dedupeKey);
-    if (lastSent && Date.now() - lastSent < 1200) {
+    if (lastSent && Date.now() - lastSent < 2000) {
       return { ok: true };
+    }
+    this.recentSentMessageCache.set(dedupeKey, Date.now());
+    if (this.recentSentMessageCache.size > 2000) {
+      const first = this.recentSentMessageCache.keys().next().value;
+      if (first) this.recentSentMessageCache.delete(first);
     }
 
     const chunks = this.splitLongMessage(text);
@@ -1069,15 +1162,12 @@ export class CloudTelegramBot {
         }
       }
 
-      if (lastResult.ok) {
-        this.recentSentMessageCache.set(dedupeKey, Date.now());
-        if (this.recentSentMessageCache.size > 2000) {
-          const first = this.recentSentMessageCache.keys().next().value;
-          if (first) this.recentSentMessageCache.delete(first);
-        }
+      if (!lastResult.ok) {
+        this.recentSentMessageCache.delete(dedupeKey);
       }
       return lastResult;
     } catch (e: any) {
+      this.recentSentMessageCache.delete(dedupeKey);
       console.error(`[CloudBot] sendMessage xatosi (${chatId}):`, e);
       return { ok: false, error: e?.message || 'Tarmoq xatosi' };
     }
@@ -1150,7 +1240,9 @@ export class CloudTelegramBot {
       const isAdmUser = this.isAdmin(fromId);
       const targetChatId = cb.message?.chat?.id;
 
-      await this.answerCallbackQuery(cb.id, 'Bajarilmoqda...');
+      if (!data.startsWith('wakeup_resp:') && !data.startsWith('shift_') && !data.startsWith('adm_ack_auto:')) {
+        await this.answerCallbackQuery(cb.id, 'Bajarilmoqda...');
+      }
 
       if (!targetChatId) return;
 
@@ -1240,17 +1332,67 @@ export class CloudTelegramBot {
         return;
       }
 
+      if (data.startsWith('shift_ext:1h:')) {
+        const attId = parseInt(data.replace('shift_ext:1h:', ''), 10);
+        if (!isNaN(attId)) {
+          await this.handleShiftExtendCallback(cb, attId, fromId, isAdmUser);
+        }
+        return;
+      }
+
+      if (data.startsWith('shift_close_plan:')) {
+        const attId = parseInt(data.replace('shift_close_plan:', ''), 10);
+        if (!isNaN(attId)) {
+          await this.handleShiftCloseFromReminderCallback(cb, attId, fromId, isAdmUser, 'plan');
+        }
+        return;
+      }
+
+      if (data.startsWith('shift_close_now:')) {
+        const attId = parseInt(data.replace('shift_close_now:', ''), 10);
+        if (!isNaN(attId)) {
+          await this.handleShiftCloseFromReminderCallback(cb, attId, fromId, isAdmUser, 'now');
+        }
+        return;
+      }
+
+      if (data.startsWith('adm_ack_auto:')) {
+        const attId = parseInt(data.replace('adm_ack_auto:', ''), 10);
+        if (!isNaN(attId)) {
+          await this.handleAdminAcknowledgeAutoCheckout(cb, attId, fromId, isAdmUser);
+        }
+        return;
+      }
+
+      return;
+    }
+
+    // 0.5. Tahrirlangan xabarlar (Telegram Jonli Joylashuv / Live Location yangilanishlari)
+    if (update.edited_message) {
+      const edited = update.edited_message;
+      if (edited.location && edited.from && !edited.from.is_bot) {
+        const editKey = `edit_${edited.chat?.id}_${edited.message_id}_${edited.edit_date || update.update_id || Date.now()}`;
+        const claimed = await this.claimDistributedMessageLock(editKey, false);
+        if (claimed) {
+          await this.handleLiveLocationUpdate(edited);
+        }
+      }
       return;
     }
 
     const message = update.message;
-    if (!message || !message.from) return;
+    if (!message || !message.from || message.from.is_bot) return;
 
     const chatId = message.chat.id;
     // Taqsimlangan atomik xabar blokirovkasi: hech qachon bitta xabarga 2 ta server javob qaytarmaydi!
-    if (message.message_id !== undefined) {
-      const msgLockKey = `msg_${chatId}_${message.message_id}`;
-      const claimed = await this.claimDistributedMessageLock(msgLockKey);
+    const msgLockKey =
+      message.message_id !== undefined
+        ? `msg_${chatId}_${message.message_id}`
+        : update.update_id !== undefined
+        ? `upd_${update.update_id}`
+        : null;
+    if (msgLockKey) {
+      const claimed = await this.claimDistributedMessageLock(msgLockKey, true);
       if (!claimed) {
         return;
       }
@@ -1622,8 +1764,20 @@ export class CloudTelegramBot {
       }
     } else if (isHelp) {
       await this.handleHelp(chatId, isAdm);
-    } else if (!isGroup) {
-      // Shaxsiy chatda noma'lum matn yozilsa, foydalanuvchiga yordam berish
+    } else if (
+      !isGroup &&
+      Boolean(
+        rawText ||
+          message.caption ||
+          message.sticker ||
+          message.photo ||
+          message.voice ||
+          message.video ||
+          message.document ||
+          message.audio
+      )
+    ) {
+      // Shaxsiy chatda noma'lum matn yoki media yozilsa, foydalanuvchiga yordam berish (xizmat xabarlariga javob berilmaydi)
       await this.sendMessage(
         chatId,
         `Kechirasiz, ushbu buyruqni tushunmadim.\n\n` +
@@ -1760,12 +1914,12 @@ export class CloudTelegramBot {
     chatId: number,
     tgUserId: string,
     isAdm: boolean,
-    coords?: { lat: number; lon: number; dist: number }
+    coords?: { lat: number; lon: number; dist: number; livePeriodSec?: number; messageId?: number }
   ) {
     // MUHIM: Lokatsiya yuborilganda (`coords` mavjud bo'lganda) oldingi so'rov qulfi uni to'sib qo'ymasligi uchun alohida kalit ishlatiladi!
     const lockKey = coords ? `checkin_gps_${tgUserId}` : `checkin_req_${tgUserId}`;
     const lastAction = this.userActionLocks.get(lockKey);
-    if (lastAction && Date.now() - lastAction < 800) {
+    if (lastAction && Date.now() - lastAction < 2500) {
       return;
     }
     this.userActionLocks.set(lockKey, Date.now());
@@ -1785,6 +1939,7 @@ export class CloudTelegramBot {
 
     // Ochiq smenani qidirish
     const activeShift = await this.findActiveShift(user.id);
+    let previousShiftClosedNote = '';
 
     if (activeShift) {
       if (activeShift.status === 'on_break') {
@@ -1797,7 +1952,7 @@ export class CloudTelegramBot {
         return;
       }
 
-      // Agar avvalgi smena eski kungi bo'lsa, xavfsiz yopamiz
+      // Agar avvalgi smena eski kungi bo'lsa, xavfsiz yopamiz va bitta javob xabariga birlashtiramiz
       const isOldDay = activeShift.date < todayStr;
       if (isOldDay) {
         const endTime = user.work_end_time || '20:00';
@@ -1830,10 +1985,7 @@ export class CloudTelegramBot {
           },
           { merge: true }
         );
-        await this.sendMessage(
-          chatId,
-          `⚠️ <i>Eslatma: Avvalgi smenangizda ketish belgilanmagan ekan. Eski smena ish rejasi (${endTime}) bo'yicha xavfsiz yopildi va yangisi ochildi.</i>`
-        );
+        previousShiftClosedNote = `\n⚠️ <i>Avvalgi smenangiz (${endTime}) ham xavfsiz yopildi.</i>`;
       } else {
         await this.sendMessage(
           chatId,
@@ -1960,6 +2112,32 @@ export class CloudTelegramBot {
     // MAXFIYLIK: Guruhda javob qaytganda jarima summasi boshqa xodimlarga oshkor qilinmaydi!
     const workerReplyPenalty = !isGroup ? privatePenaltyNote : '';
 
+    // Agar kelishda Jonli joylashuv (Live Location) yuborilgan bo'lsa, fonda kuzatuvni ham yoqamiz (bitta xabarda!)
+    let liveLocationAttached = false;
+    if (
+      coords?.livePeriodSec &&
+      coords.livePeriodSec > 0 &&
+      !isGroup &&
+      this.liveLocationAutoCheckoutEnabled &&
+      this.autoCheckoutOnDistanceEnabled
+    ) {
+      this.registerLiveLocationSession(
+        user,
+        newAttendance,
+        chatId,
+        coords.messageId || 0,
+        coords.livePeriodSec,
+        coords.dist
+      );
+      liveLocationAttached = true;
+    }
+
+    const liveLocTip = liveLocationAttached
+      ? `\n\n📡 <b>Jonli joylashuv kuzatuvi ulandi!</b> Do'kondan chiqib ketganingizda Mini Appni ochmasangiz ham tizim avtomatik chiqishni qayd etadi.`
+      : !isGroup && this.liveLocationAutoCheckoutEnabled && this.autoCheckoutOnDistanceEnabled
+      ? `\n\n📡 <i>Maslahat: Ketishda unutmaslik uchun 📎 → Joylashuv → «Jonli joylashuv» ni yoqib qo'ysangiz, do'kondan ketganingizda tizim avtomatik chiqaradi.</i>`
+      : '';
+
     await this.sendMessage(
       chatId,
       `✅ <b>Ishga kelganingiz qayd etildi!${shiftText}</b>\n\n` +
@@ -1967,8 +2145,10 @@ export class CloudTelegramBot {
         `🕒 Kelgan vaqt: <b>${timeStr.slice(0, 5)}</b> (${todayStr})` +
         locTextForUser +
         `${lateNote}` +
-        `${workerReplyPenalty}\n\n` +
-        `Kuningiz barakali va sermahsul o'tsin!`,
+        `${workerReplyPenalty}` +
+        `${previousShiftClosedNote}\n\n` +
+        `Kuningiz barakali va sermahsul o'tsin!` +
+        liveLocTip,
       this.getMainKeyboard(isAdm)
     );
 
@@ -2003,7 +2183,7 @@ export class CloudTelegramBot {
   private async handleLocationReceived(message: any, isAdm: boolean, isGroup: boolean) {
     const tgUserId = String(message.from.id);
     const chatId = message.chat.id;
-    const { latitude, longitude } = message.location;
+    const { latitude, longitude, live_period } = message.location;
 
     const user = await this.findUserByTelegramId(tgUserId);
     if (!user) {
@@ -2043,12 +2223,48 @@ export class CloudTelegramBot {
       }
 
       this.pendingCheckoutLocationUsers.delete(tgUserId);
+      this.liveLocationSessions.delete(tgUserId);
       await this.handleCheckOut(chatId, tgUserId, {
         lat: latitude,
         lon: longitude,
         dist: roundedDist,
       });
       return;
+    }
+
+    // Agar xodim allaqachon ishda bo'lsa va Jonli joylashuv (Live Location) ulashgan bo'lsa
+    const isCheckInPending = this.pendingLocationUsers.has(tgUserId);
+    if (!isCheckInPending) {
+      const existingShift = await this.findActiveShift(user.id);
+      if (existingShift) {
+        if (typeof live_period === 'number' && live_period > 0 && !isGroup) {
+          this.registerLiveLocationSession(
+            user,
+            existingShift,
+            chatId,
+            message.message_id,
+            live_period,
+            roundedDist
+          );
+          await this.sendMessage(
+            chatId,
+            `📡 <b>Jonli joylashuv kuzatuvi faollashtirildi!</b>\n\n` +
+              `🏢 Do'kon: <b>${escapeHtml(this.shopName)}</b>\n` +
+              `📏 Joriy masofa: <b>${roundedDist} metr</b>\n` +
+              `⏱ Kuzatuv muddati: <b>${Math.round(live_period / 60)} daqiqa</b>\n\n` +
+              `✅ Endi telefon cho'ntagingizda bo'lsa ham, do'kondan uzoqlashganingizda tizim avtomatik chiqib ketganingizni qayd etadi.`,
+            this.getMainKeyboard(isAdm)
+          );
+          return;
+        }
+        await this.sendMessage(
+          chatId,
+          `ℹ️ Siz allaqachon ishdasiz (Kelgan: <b>${existingShift.check_in_time.slice(0, 5)}</b>).\n\n` +
+            `Ketayotganda <b>«🏃‍♂️ Ishdan ketdim»</b> tugmasini bosing yoki fonda avtomatik chiqish uchun 📎 → Joylashuv → <b>«Jonli joylashuv»</b> ulashing.`,
+          this.getMainKeyboard(isAdm)
+        );
+        return;
+      }
     }
 
     const allowedRadius = Math.max(this.gpsRadiusMeters + 150, 250);
@@ -2068,12 +2284,14 @@ export class CloudTelegramBot {
       return;
     }
 
-    // Radius ichida bo'lsa -> Ishga kelishni tasdiqlash
+    // Radius ichida bo'lsa -> Ishga kelishni tasdiqlash (va Jonli joylashuv bo'lsa bitta javob ichida kuzatuvni ulash)
     this.pendingLocationUsers.delete(tgUserId);
     await this.handleCheckIn(chatId, tgUserId, isAdm, {
       lat: latitude,
       lon: longitude,
       dist: roundedDist,
+      livePeriodSec: typeof live_period === 'number' && live_period > 0 ? live_period : undefined,
+      messageId: message.message_id,
     });
   }
 
@@ -2322,9 +2540,12 @@ export class CloudTelegramBot {
         chargeable_late_minutes: penaltyInfo.chargeableLateMinutes,
         late_penalty: penaltyInfo.penaltyAmount,
         note: locNote,
+        needs_admin_review: false,
+        auto_checkout_extended_until_ms: null,
       },
       { merge: true }
     );
+    this.liveLocationSessions.delete(tgUserId);
 
     // Bugungi jami daqiqalar (bazadan haqqoniy hisoblanadi)
     const todayTotalMinutes = await this.getTodayTotalMinutes(user.id, todayStr);
@@ -3213,10 +3434,695 @@ export class CloudTelegramBot {
         if (hour >= 18 && minute % 2 === 0) {
           await this.checkAndTriggerDailyClosingReportIfAllFinished(tp.dateStr);
         }
+
+        // 4. ⏰ Ish vaqti tugaganda Aqlli Eslatma + Javob bermasa Avtomatik Yopish (2-yo'l)
+        if (this.autoCheckoutReminderEnabled) {
+          await this.checkAndProcessScheduledAutoCheckout();
+        }
       } catch (err) {
         console.error('[CloudBot Cron Error]', err);
       }
     }, 30000);
+  }
+
+  // =========================================================================
+  // 📡 1-YO'L: TELEGRAM JONLI JOYLASHUV (LIVE LOCATION) FONDA KUZATISH
+  // =========================================================================
+  private registerLiveLocationSession(
+    user: User,
+    activeShift: Attendance,
+    chatId: number,
+    messageId: number,
+    livePeriodSec: number,
+    distMeters: number
+  ) {
+    const tgUserId = String(user.telegram_id || '').trim();
+    if (!tgUserId) return;
+    const nowMs = Date.now();
+    this.liveLocationSessions.set(tgUserId, {
+      userId: user.id,
+      attendanceId: activeShift.id,
+      tgUserId,
+      chatId,
+      messageId,
+      startedAtMs: nowMs,
+      expiresAtMs: nowMs + Math.max(60, livePeriodSec) * 1000,
+      outOfBoundsCount: 0,
+      firstOutOfBoundsMs: 0,
+      lastDistMeters: distMeters,
+      lastUpdatedMs: nowMs,
+    });
+  }
+
+  private async handleLiveLocationUpdate(editedMsg: any) {
+    try {
+      const tgUserId = String(editedMsg.from?.id || '').trim();
+      const chatId = editedMsg.chat?.id;
+      const loc = editedMsg.location;
+      if (!tgUserId || !chatId || !loc) return;
+      if (chatId < 0) return; // Faqat shaxsiy chatdagi jonli joylashuv
+
+      const user = await this.findUserByTelegramId(tgUserId);
+      if (!user) return;
+
+      const activeShift = await this.findActiveShift(user.id);
+      if (!activeShift) {
+        this.liveLocationSessions.delete(tgUserId);
+        return;
+      }
+
+      const existingSession = this.liveLocationSessions.get(tgUserId);
+
+      // Agar foydalanuvchi jonli joylashuvni muddatidan oldin qo'lda to'xtatgan bo'lsa
+      if (!loc.live_period || loc.live_period <= 0) {
+        if (
+          existingSession &&
+          existingSession.attendanceId === activeShift.id &&
+          Date.now() < existingSession.expiresAtMs - 120000 &&
+          activeShift.status === 'working'
+        ) {
+          this.liveLocationSessions.delete(tgUserId);
+          const claimedStop = await this.claimDistributedMessageLock(`live_stop_${activeShift.id}`, true);
+          if (claimedStop) {
+            await this.sendMessage(
+              chatId,
+              `⚠️ <b>Jonli joylashuv uzatish to'xtatildi.</b>\n\n` +
+                `Do'kondan ketayotganda <b>«🏃‍♂️ Ishdan ketdim»</b> tugmasini bosishni unutmang (yoki smena tugaganda bot o'zi eslatadi).`
+            );
+            await this.notifyAdmins(
+              `📡 <i>${escapeHtml(user.full_name)} jonli joylashuvni o'chirdi (hali smenada).</i>`,
+              chatId,
+              `📡 <b>Eslatma:</b> <b>${escapeHtml(user.full_name)}</b> jonli joylashuv ulashishni muddatidan oldin to'xtatdi (hali ishda).`
+            );
+          }
+        } else {
+          this.liveLocationSessions.delete(tgUserId);
+        }
+        return;
+      }
+
+      if (!this.liveLocationAutoCheckoutEnabled || !this.autoCheckoutOnDistanceEnabled) {
+        return;
+      }
+
+      // Tanaffus paytida (masalan tushlikka chiqqanda) avtomatik ishdan chiqarib yubormaymiz!
+      if (activeShift.status !== 'working') {
+        if (existingSession) {
+          existingSession.outOfBoundsCount = 0;
+          existingSession.firstOutOfBoundsMs = 0;
+        }
+        return;
+      }
+
+      // GPS aniqligi past bo'lsa (>80m bino ichida sakrash) hisobga olmaymiz
+      if (typeof loc.horizontal_accuracy === 'number' && loc.horizontal_accuracy > 80) {
+        return;
+      }
+
+      const dist = Math.round(
+        haversineDistanceMeters(loc.latitude, loc.longitude, this.marketLatitude, this.marketLongitude)
+      );
+
+      // Server qayta ishga tushgan bo'lsa ham sessiyani darhol tiklaymiz
+      const nowMs = Date.now();
+      const session =
+        existingSession && existingSession.attendanceId === activeShift.id
+          ? existingSession
+          : {
+              userId: user.id,
+              attendanceId: activeShift.id,
+              tgUserId,
+              chatId,
+              messageId: editedMsg.message_id,
+              startedAtMs: nowMs,
+              expiresAtMs: nowMs + loc.live_period * 1000,
+              outOfBoundsCount: 0,
+              firstOutOfBoundsMs: 0,
+              lastDistMeters: dist,
+              lastUpdatedMs: nowMs,
+            };
+
+      session.lastDistMeters = dist;
+      session.lastUpdatedMs = nowMs;
+      session.expiresAtMs = nowMs + loc.live_period * 1000;
+      this.liveLocationSessions.set(tgUserId, session);
+
+      // Kamida 15 daqiqa ishlagan bo'lishi shart (keliboq chiqib ketmasligi uchun)
+      const workedSoFar = getAccurateAttendanceMinutes(activeShift);
+      if (workedSoFar < 15) {
+        session.outOfBoundsCount = 0;
+        session.firstOutOfBoundsMs = 0;
+        return;
+      }
+
+      // Xavfsizlik buferi bilan radius chegarasi (masalan 100m -> 180m)
+      const safeThreshold = Math.max(this.autoCheckoutDistanceMeters + 80, 180);
+
+      if (dist > safeThreshold) {
+        session.outOfBoundsCount += 1;
+        if (!session.firstOutOfBoundsMs) {
+          session.firstOutOfBoundsMs = nowMs;
+        }
+        // Kamida 3 ta ketma-ket signal VA kamida 45 soniya davomida do'kondan tashqarida bo'lsa
+        if (session.outOfBoundsCount >= 3 && nowMs - session.firstOutOfBoundsMs >= 45000) {
+          const tp = getTashkentParts();
+          const secStr = String(tp.second).padStart(2, '0');
+          await this.executeAtomicAutoCheckout(activeShift.id, user, {
+            source: 'live_location',
+            checkOutDateStr: tp.dateStr,
+            checkOutTimeStr: `${tp.timeStr}:${secStr}`,
+            distanceMeters: dist,
+            needsAdminReview: false,
+          });
+          this.liveLocationSessions.delete(tgUserId);
+        }
+      } else {
+        // Xodim yana do'kon hududida
+        session.outOfBoundsCount = 0;
+        session.firstOutOfBoundsMs = 0;
+      }
+    } catch (err) {
+      console.error('[CloudBot LiveLocation Error]', err);
+    }
+  }
+
+  // =========================================================================
+  // ⏰ 2-YO'L: ISH VAQTI TUGAGANDA AQLLI ESLATMA + AVTOMATIK YOPISH
+  // =========================================================================
+  public async checkAndProcessScheduledAutoCheckout(): Promise<void> {
+    if (!this.autoCheckoutReminderEnabled || !this.botToken) return;
+    try {
+      const openSnap = await getDocs(
+        query(collection(db, 'attendance'), where('status', 'in', ['working', 'on_break']))
+      );
+      if (openSnap.empty) return;
+
+      const usersSnap = await getDocs(collection(db, 'users'));
+      const userMap = new Map<number, User>();
+      usersSnap.forEach((d) => {
+        const u = d.data() as User;
+        userMap.set(Number(u.id || d.id), { ...u, id: Number(u.id || d.id) });
+      });
+
+      const nowMs = Date.now();
+      const delayMs = this.autoCheckoutReminderDelayMinutes * 60000;
+      const graceMs = this.autoCheckoutGraceAfterReminderMinutes * 60000;
+
+      for (const docSnap of openSnap.docs) {
+        const raw = docSnap.data() as Attendance;
+        const att: Attendance = { ...raw, id: Number(raw.id || docSnap.id) };
+        const user = userMap.get(att.user_id);
+        if (!user) continue;
+
+        const sched = getScheduledShiftEndInfo(
+          att.date,
+          att.check_in_time,
+          user.work_start_time || '08:00',
+          user.work_end_time || '20:00'
+        );
+
+        const extendedUntilMs =
+          typeof att.auto_checkout_extended_until_ms === 'number' && att.auto_checkout_extended_until_ms > 0
+            ? att.auto_checkout_extended_until_ms
+            : 0;
+        const hasExtension = extendedUntilMs > sched.shiftEndRealMs;
+        const effectiveEndRealMs = Math.max(sched.shiftEndRealMs, extendedUntilMs);
+        const reminderTriggerMs = hasExtension ? effectiveEndRealMs : effectiveEndRealMs + delayMs;
+        const remindedAtMs = att.auto_checkout_reminded_at ? Date.parse(att.auto_checkout_reminded_at) : 0;
+
+        // A) Juda eski (masalan kechagi/avvalgi kungi, reja tugashidan 3+ soat o'tib ketgan) yopilmagan smena:
+        // "Hali ishdamisiz?" deb kechikkan savol bermasdan, to'g'ridan-to'g'ri reja vaqti bilan xavfsiz yopamiz.
+        if (!remindedAtMs && nowMs >= effectiveEndRealMs + Math.max(3 * 3600000, delayMs + graceMs)) {
+          const closeRefDate = new Date(effectiveEndRealMs);
+          await this.executeAtomicAutoCheckout(att.id, user, {
+            source: 'schedule',
+            checkOutDateStr: getTashkentDateString(closeRefDate),
+            checkOutTimeStr: getTashkentTimeString(closeRefDate, true),
+            needsAdminReview: true,
+          });
+          continue;
+        }
+
+        // B) 1-bosqich: Smena tugagandan keyin hali eslatma yuborilmagan bo'lsa -> tugmali eslatma yuborish
+        if (!remindedAtMs && nowMs >= reminderTriggerMs) {
+          const claimed = await runTransaction(db, async (tx) => {
+            const ref = doc(db, 'attendance', String(att.id));
+            const freshSnap = await tx.get(ref);
+            if (!freshSnap.exists()) return false;
+            const fresh = freshSnap.data() as Attendance;
+            if (fresh.status !== 'working' && fresh.status !== 'on_break') return false;
+            if (fresh.auto_checkout_reminded_at) return false;
+            tx.set(
+              ref,
+              {
+                auto_checkout_reminded_at: new Date(nowMs).toISOString(),
+              },
+              { merge: true }
+            );
+            return true;
+          });
+
+          if (!claimed) continue;
+
+          const endDisplay = getTashkentTimeString(new Date(effectiveEndRealMs), false);
+          const graceMins = this.autoCheckoutGraceAfterReminderMinutes;
+
+          if (user.telegram_id) {
+            const text =
+              `⏰ <b>Ish vaqtingiz yakunlandi!</b>\n\n` +
+              `Hurmatli <b>${escapeHtml(user.full_name)}</b>, bugungi smenangiz (reja: <b>${endDisplay}</b>) tugadi, lekin hali <b>«🏃‍♂️ Ishdan ketdim»</b> tugmasi bosilmagan.\n\n` +
+              `Iltimos, holatingizni tasdiqlang:\n` +
+              `<i>(${graceMins} daqiqa ichida javob berilmasa, tizim smenangizni avtomatik <b>${endDisplay}</b> bilan yopadi)</i>`;
+
+            const markup = {
+              inline_keyboard: [
+                [
+                  { text: '🟢 Ha, ishdamiz (+1 soat)', callback_data: `shift_ext:1h:${att.id}` },
+                  { text: `🔴 Ketdim (${endDisplay})`, callback_data: `shift_close_plan:${att.id}` },
+                ],
+                [
+                  { text: '📍 Hozirgi vaqt bilan ketdim', callback_data: `shift_close_now:${att.id}` },
+                ],
+              ],
+            };
+            await this.sendMessage(String(user.telegram_id), text, markup);
+          } else {
+            // Telegram ID bog'lanmagan xodim bo'lsa adminga xabar beramiz
+            await this.notifyAdmins(
+              `⏰ <b>Eslatma:</b> ${escapeHtml(user.full_name)} ning smenasi (${endDisplay}) tugadi, lekin ketish bosilmagan.`,
+              undefined,
+              `⏰ <b>Diqqat (Admin):</b> <b>${escapeHtml(user.full_name)}</b> ning smenasi (<b>${endDisplay}</b>) tugagan, lekin botga bog'lanmagan. ${graceMins} daqiqada yopilmasa tizim o'zi ${endDisplay} bilan yopadi.`
+            );
+          }
+          continue;
+        }
+
+        // C) 2-bosqich: Eslatma yuborilganidan keyin grace vaqti (masalan 30 daqiqa) o'tsa ham javob bo'lmasa -> Avtomatik yopish!
+        if (remindedAtMs > 0 && nowMs >= remindedAtMs + graceMs) {
+          // Agar foydalanuvchi yangi uzaytirish olgan bo'lsa va uzaytirish muddati hali tugamagan bo'lsa kutamiz
+          if (extendedUntilMs > nowMs) continue;
+
+          const closeRefDate = new Date(effectiveEndRealMs);
+          await this.executeAtomicAutoCheckout(att.id, user, {
+            source: 'schedule',
+            checkOutDateStr: getTashkentDateString(closeRefDate),
+            checkOutTimeStr: getTashkentTimeString(closeRefDate, true),
+            needsAdminReview: true,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[CloudBot Scheduled AutoCheckout Error]', err);
+    }
+  }
+
+  // --- Atomik Avtomatik Yopish (Hech qachon 2 marta yopilmaydi va ma'lumot yo'qolmaydi) ---
+  private async executeAtomicAutoCheckout(
+    attId: number,
+    user: User,
+    opts: {
+      source: 'live_location' | 'schedule' | 'worker_button';
+      checkOutDateStr: string;
+      checkOutTimeStr: string;
+      distanceMeters?: number;
+      customNote?: string;
+      needsAdminReview?: boolean;
+    }
+  ): Promise<{ closed: boolean; att?: Attendance }> {
+    try {
+      const attRef = doc(db, 'attendance', String(attId));
+      const preSnap = await getDoc(attRef);
+      if (!preSnap.exists()) return { closed: false };
+      const preData = preSnap.data() as Attendance;
+      if (preData.status === 'completed') return { closed: false };
+
+      const sameDaySnap = await getDocs(
+        query(
+          collection(db, 'attendance'),
+          where('user_id', '==', user.id),
+          where('date', '==', preData.date)
+        )
+      );
+      const sameDayList: Attendance[] = [];
+      sameDaySnap.forEach((d) => {
+        const raw = d.data() as Attendance;
+        sameDayList.push({ ...raw, id: Number(raw.id || d.id) });
+      });
+      sameDayList.sort(
+        (a, b) => (a.check_in_time || '').localeCompare(b.check_in_time || '') || a.id - b.id
+      );
+      const shiftIdx = Math.max(1, sameDayList.findIndex((item) => item.id === attId) + 1);
+
+      const isBossOrAdmin =
+        (user.telegram_id ? this.isAdmin(String(user.telegram_id)) : false) ||
+        user.role === 'admin' ||
+        /boshliq|admin|rahbar|direktor|owner/i.test(user.position || '');
+
+      const penaltySettings = this.getPenaltySettings();
+
+      const txResult = await runTransaction(db, async (tx) => {
+        const snap = await tx.get(attRef);
+        if (!snap.exists()) return { closed: false as const };
+        const att = { ...(snap.data() as Attendance), id: Number((snap.data() as any).id || attId) };
+        if (att.status === 'completed') return { closed: false as const };
+
+        let totalBreak = att.total_break_minutes || 0;
+        if (att.status === 'on_break' && att.note?.startsWith('Tanaffus: ')) {
+          try {
+            const rawNote = att.note.replace('Tanaffus: ', '').trim();
+            const startMs = /^\d+$/.test(rawNote) ? parseInt(rawNote, 10) : new Date(rawNote).getTime();
+            const extraBreak = Math.max(1, Math.round((Date.now() - startMs) / 60000));
+            totalBreak += Math.min(extraBreak, 180);
+          } catch {}
+        }
+
+        const workedMinutes = Math.max(
+          1,
+          calculateShiftWorkedMinutes(
+            att.date,
+            att.check_in_time,
+            opts.checkOutDateStr,
+            opts.checkOutTimeStr,
+            totalBreak
+          )
+        );
+
+        const penaltyInfo = isBossOrAdmin
+          ? { lateMinutes: 0, chargeableLateMinutes: 0, penaltyAmount: 0 }
+          : calculateLatePenaltyAmount(
+              att.check_in_time,
+              user.work_start_time || '08:00',
+              shiftIdx,
+              penaltySettings
+            );
+
+        const outShort = opts.checkOutTimeStr.slice(0, 5);
+        let noteText = opts.customNote || '';
+        if (!noteText) {
+          if (opts.source === 'live_location') {
+            noteText = `📡 Jonli joylashuv orqali avtomatik ketish (Do'kondan ${opts.distanceMeters || 0}m uzoqlashdi)`;
+          } else if (opts.source === 'schedule') {
+            noteText = `⏰ Ketish bosilmagani sababli tizim ${outShort} bilan avtomatik yopdi`;
+          } else {
+            noteText = `✅ Eslatma tugmasi orqali ${outShort} bilan yopildi`;
+          }
+        }
+
+        const updated: Partial<Attendance> = {
+          status: 'completed',
+          check_out_date: opts.checkOutDateStr,
+          check_out_time: opts.checkOutTimeStr,
+          worked_minutes: workedMinutes,
+          total_break_minutes: totalBreak,
+          late_minutes: penaltyInfo.lateMinutes,
+          chargeable_late_minutes: penaltyInfo.chargeableLateMinutes,
+          late_penalty: penaltyInfo.penaltyAmount,
+          note: noteText,
+          auto_checkout_source: opts.source,
+          needs_admin_review: Boolean(opts.needsAdminReview),
+        };
+
+        tx.set(attRef, updated, { merge: true });
+        return {
+          closed: true as const,
+          att: { ...att, ...updated } as Attendance,
+          penaltyInfo,
+          workedMinutes,
+          totalBreak,
+        };
+      });
+
+      if (!txResult.closed || !txResult.att) return { closed: false };
+
+      if (user.telegram_id) {
+        this.liveLocationSessions.delete(String(user.telegram_id));
+      }
+
+      const todayTotalMinutes = await this.getTodayTotalMinutes(user.id, opts.checkOutDateStr);
+      const formattedWorked = formatMinutes(txResult.workedMinutes);
+      const formattedTodayTotal = formatMinutes(todayTotalMinutes);
+      const inShort = txResult.att.check_in_time.slice(0, 5);
+      const outShort = opts.checkOutTimeStr.slice(0, 5);
+      const breakText =
+        txResult.totalBreak > 0 ? ` (☕️ Tanaffus: ${formatMinutes(txResult.totalBreak)})` : '';
+
+      // 1. Xodimga shaxsiy xabar
+      if (user.telegram_id) {
+        const isUserAdm = this.isAdmin(String(user.telegram_id));
+        const header =
+          opts.source === 'live_location'
+            ? `📡 <b>Do'kondan uzoqlashganingiz sababli chiqishingiz avtomatik qayd etildi!</b>`
+            : opts.source === 'schedule'
+            ? `⏰ <b>Smenangiz avtomatik yopildi!</b>`
+            : `🏁 <b>Ishdan ketganingiz qayd etildi!</b>`;
+
+        const reasonDetail =
+          opts.source === 'live_location'
+            ? `\n📍 Sabab: Do'kondan <b>${opts.distanceMeters} metr</b> uzoqlashdingiz (Jonli joylashuv)`
+            : opts.source === 'schedule'
+            ? `\n⚠️ <i>Ketishni bosish esingizdan chiqqani sababli tizim reja bo'yicha <b>${outShort}</b> da yopdi. Agar boshqa vaqtda ketgan bo'lsangiz, adminga xabar bering.</i>`
+            : '';
+
+        const penaltyLine =
+          this.latePenaltyEnabled && txResult.penaltyInfo.penaltyAmount > 0
+            ? `\n⚠️ Kechikish jarimasi: <b>${formatUzSum(txResult.penaltyInfo.penaltyAmount)}</b>`
+            : '';
+
+        await this.sendMessage(
+          String(user.telegram_id),
+          `${header}\n\n` +
+            `👤 Xodim: <b>${escapeHtml(user.full_name)}</b>\n` +
+            `🟢 Kelgan: <b>${inShort}</b> | 🔴 Ketgan: <b>${outShort}</b>\n` +
+            `⏱ Ushbu smena: <b>${formattedWorked}</b>${breakText}` +
+            penaltyLine +
+            reasonDetail +
+            `\n\n📊 <b>Bugun jami:</b> <b>${formattedTodayTotal}</b>`,
+          this.getMainKeyboard(isUserAdm)
+        );
+      }
+
+      // 2. Guruh va Adminlarga xabar
+      const badge =
+        opts.source === 'live_location'
+          ? `📡 <b>Avtomatik ketdi (Jonli GPS — ${opts.distanceMeters}m):</b>`
+          : opts.source === 'schedule'
+          ? `⏰ <b>Avtomatik yopildi (Ketish unutilgan):</b>`
+          : `🔴 <b>Ishdan ketdi (Eslatma orqali):</b>`;
+
+      const publicNotify =
+        `${badge} ${escapeHtml(user.full_name)}\n` +
+        `🟢 Kelgan: <b>${inShort}</b> | 🔴 Ketgan: <b>${outShort}</b>\n` +
+        `⏱ Smena: <b>${formattedWorked}</b>${breakText}\n` +
+        `📊 Bugungi jami: <b>${formattedTodayTotal}</b>`;
+
+      const privatePenalty =
+        this.latePenaltyEnabled && txResult.penaltyInfo.penaltyAmount > 0
+          ? `\n⚠️ Smena jarimasi: <b>${formatUzSum(txResult.penaltyInfo.penaltyAmount)}</b>`
+          : '';
+
+      // Guruhga oddiy xabar
+      for (const target of this.notifyTargetIds) {
+        if (target.startsWith('-')) {
+          await this.sendMessage(target, publicNotify);
+        } else {
+          // Shaxsiy adminga tasdiqlash/tahrirlash tugmalari bilan
+          const adminMarkup = opts.needsAdminReview
+            ? {
+                inline_keyboard: [
+                  [
+                    { text: `✅ To'g'ri (${outShort})`, callback_data: `adm_ack_auto:${attId}` },
+                    { text: '✏️ Vaqtni tuzatish', url: normalizePublicWebappUrl(this.webappUrl) },
+                  ],
+                ],
+              }
+            : undefined;
+          await this.sendMessage(target, publicNotify + privatePenalty, adminMarkup);
+        }
+      }
+
+      await this.checkAndTriggerDailyClosingReportIfAllFinished(opts.checkOutDateStr);
+      return { closed: true, att: txResult.att };
+    } catch (err) {
+      console.error('[CloudBot executeAtomicAutoCheckout Error]', err);
+      return { closed: false };
+    }
+  }
+
+  // --- Eslatma tugmalari handlerlari ---
+  private async handleShiftExtendCallback(cb: any, attId: number, fromId: string, isAdmUser: boolean) {
+    const targetChatId = cb.message?.chat?.id;
+    const attRef = doc(db, 'attendance', String(attId));
+    const snap = await getDoc(attRef);
+    if (!snap.exists()) {
+      await this.answerCallbackQuery(cb.id, "Smena topilmadi.", true);
+      return;
+    }
+    const att = { ...(snap.data() as Attendance), id: attId };
+    if (att.status === 'completed') {
+      await this.answerCallbackQuery(cb.id, "Bu smena allaqachon yopilgan!", true);
+      return;
+    }
+
+    const user = await this.findUserByTelegramId(fromId);
+    if (!isAdmUser && (!user || user.id !== att.user_id)) {
+      await this.answerCallbackQuery(cb.id, "Faqat smena egasi tasdiqlashi mumkin.", true);
+      return;
+    }
+
+    const targetUser = user && user.id === att.user_id ? user : await this.findUserById(att.user_id);
+    const currentExtendCount = att.auto_checkout_extend_count || 0;
+    if (currentExtendCount >= 4) {
+      await this.answerCallbackQuery(
+        cb.id,
+        "Maksimal uzaytirish (4 soat) tugadi. Iltimos adminga murojaat qiling.",
+        true
+      );
+      return;
+    }
+
+    const sched = getScheduledShiftEndInfo(
+      att.date,
+      att.check_in_time,
+      targetUser?.work_start_time || '08:00',
+      targetUser?.work_end_time || '20:00'
+    );
+    const baseMs = Math.max(Date.now(), sched.shiftEndRealMs, att.auto_checkout_extended_until_ms || 0);
+    const newExtendedUntilMs = baseMs + 60 * 60000;
+
+    await setDoc(
+      attRef,
+      {
+        auto_checkout_extended_until_ms: newExtendedUntilMs,
+        auto_checkout_extend_count: currentExtendCount + 1,
+        auto_checkout_reminded_at: null,
+      },
+      { merge: true }
+    );
+
+    const nextTimeDisplay = getTashkentTimeString(new Date(newExtendedUntilMs), false);
+    await this.answerCallbackQuery(cb.id, `✅ Ish vaqti ${nextTimeDisplay} gacha uzaytirildi!`);
+    if (targetChatId) {
+      await this.sendMessage(
+        targetChatId,
+        `🟢 <b>Ish vaqtingiz +1 soatga uzaytirildi!</b>\n\n` +
+          `⏰ Keyingi eslatma: <b>${nextTimeDisplay}</b>\n` +
+          `Ishni yakunlaganingizda <b>«🏃‍♂️ Ishdan ketdim»</b> tugmasini bosing.`
+      );
+    }
+
+    if (targetUser) {
+      await this.notifyAdmins(
+        `🕒 <b>${escapeHtml(targetUser.full_name)}</b> ishda qolayotganini tasdiqladi (+1 soat, ${nextTimeDisplay} gacha).`,
+        targetChatId
+      );
+    }
+  }
+
+  private async handleShiftCloseFromReminderCallback(
+    cb: any,
+    attId: number,
+    fromId: string,
+    isAdmUser: boolean,
+    mode: 'plan' | 'now'
+  ) {
+    const attRef = doc(db, 'attendance', String(attId));
+    const snap = await getDoc(attRef);
+    if (!snap.exists()) {
+      await this.answerCallbackQuery(cb.id, "Smena topilmadi.", true);
+      return;
+    }
+    const att = { ...(snap.data() as Attendance), id: attId };
+    if (att.status === 'completed') {
+      await this.answerCallbackQuery(cb.id, "Bu smena allaqachon yopilgan!", true);
+      return;
+    }
+
+    const callerUser = await this.findUserByTelegramId(fromId);
+    if (!isAdmUser && (!callerUser || callerUser.id !== att.user_id)) {
+      await this.answerCallbackQuery(cb.id, "Faqat smena egasi yopishi mumkin.", true);
+      return;
+    }
+
+    const targetUser =
+      callerUser && callerUser.id === att.user_id ? callerUser : await this.findUserById(att.user_id);
+    if (!targetUser) return;
+
+    let closeDateStr: string;
+    let closeTimeStr: string;
+
+    if (mode === 'plan') {
+      const sched = getScheduledShiftEndInfo(
+        att.date,
+        att.check_in_time,
+        targetUser.work_start_time || '08:00',
+        targetUser.work_end_time || '20:00'
+      );
+      const effectiveEndMs = Math.max(sched.shiftEndRealMs, att.auto_checkout_extended_until_ms || 0);
+      const refDate = new Date(effectiveEndMs);
+      closeDateStr = getTashkentDateString(refDate);
+      closeTimeStr = getTashkentTimeString(refDate, true);
+    } else {
+      const tp = getTashkentParts();
+      closeDateStr = tp.dateStr;
+      closeTimeStr = `${tp.timeStr}:${String(tp.second).padStart(2, '0')}`;
+    }
+
+    await this.answerCallbackQuery(cb.id, '🏁 Smena yopilmoqda...');
+    await this.executeAtomicAutoCheckout(attId, targetUser, {
+      source: 'worker_button',
+      checkOutDateStr: closeDateStr,
+      checkOutTimeStr: closeTimeStr,
+      needsAdminReview: mode === 'now',
+    });
+  }
+
+  private async handleAdminAcknowledgeAutoCheckout(
+    cb: any,
+    attId: number,
+    _fromId: string,
+    isAdmUser: boolean
+  ) {
+    if (!isAdmUser) {
+      await this.answerCallbackQuery(cb.id, "Faqat adminlar tasdiqlashi mumkin!", true);
+      return;
+    }
+    const attRef = doc(db, 'attendance', String(attId));
+    const snap = await getDoc(attRef);
+    if (!snap.exists()) {
+      await this.answerCallbackQuery(cb.id, "Yozuv topilmadi.", true);
+      return;
+    }
+    const data = snap.data() as Attendance;
+    const newNote = data.note?.includes('Admin tasdiqladi')
+      ? data.note
+      : `${data.note || 'Avtomatik yopilgan'} (✅ Admin tasdiqladi)`;
+    await setDoc(
+      attRef,
+      {
+        needs_admin_review: false,
+        note: newNote,
+      },
+      { merge: true }
+    );
+    await this.answerCallbackQuery(cb.id, '✅ Tasdiqlandi!');
+    if (cb.message?.chat?.id) {
+      await this.sendMessage(cb.message.chat.id, `✅ Davomat yozuvi (#${attId}) Admin tomonidan tasdiqlandi!`);
+    }
+  }
+
+  private async findUserById(userId: number): Promise<User | null> {
+    const q = query(collection(db, 'users'), where('id', '==', userId));
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      const raw = snap.docs[0].data() as User;
+      return { ...raw, id: Number(raw.id || snap.docs[0].id) };
+    }
+    const byDoc = await getDoc(doc(db, 'users', String(userId)));
+    if (byDoc.exists()) {
+      const raw = byDoc.data() as User;
+      return { ...raw, id: Number(raw.id || byDoc.id) };
+    }
+    return null;
   }
 
   // --- ☀️ ERTALABKI UYG'OTUVCHI VA ISHGA CHAQIRUVCHI ESLATMA ---

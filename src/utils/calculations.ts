@@ -611,3 +611,80 @@ export function formatUzSum(amount: number): string {
   return `${rounded.toLocaleString('uz-UZ').replace(/,/g, ' ')} so'm`;
 }
 
+const UZ_OFFSET_MS = 5 * 3600 * 1000;
+
+/**
+ * Toshkent mahalliy sana (YYYY-MM-DD) va vaqtini (HH:mm[:ss]) haqiqiy UTC epoch ms ga aylantiradi.
+ */
+export function tashkentDateTimeToRealMs(dateStr: string, timeStr: string): number {
+  const d = parseDateParts(dateStr);
+  const t = parseTimeParts(timeStr);
+  return Date.UTC(d.year, d.month - 1, d.day, t.hours, t.minutes, t.seconds) - UZ_OFFSET_MS;
+}
+
+/**
+ * Xodimning ochiq smenasi qachon (haqiqiy UTC epoch ms da) tugashi kerakligini 100% aniqlikda hisoblaydi.
+ * Kunduzgi smena (08:00-20:00), tungi smena (20:00-08:00) va ish vaqtidan keyingi qo'shimcha kirishlarni to'g'ri ajratadi.
+ */
+export function getScheduledShiftEndInfo(
+  checkInDate: string,
+  checkInTime: string,
+  workStartTime: string = '08:00',
+  workEndTime: string = '20:00'
+): {
+  checkInRealMs: number;
+  shiftEndRealMs: number;
+  endDateStr: string;
+  endTimeStr: string;
+  isOvertimeCheckIn: boolean;
+} {
+  const inDate = parseDateParts(checkInDate);
+  const inTime = parseTimeParts(checkInTime);
+  const startP = parseTimeParts(workStartTime || '08:00');
+  const endP = parseTimeParts(workEndTime || '20:00');
+
+  const checkInRealMs =
+    Date.UTC(inDate.year, inDate.month - 1, inDate.day, inTime.hours, inTime.minutes, inTime.seconds) -
+    UZ_OFFSET_MS;
+
+  const startMins = startP.hours * 60 + startP.minutes;
+  const endMins = endP.hours * 60 + endP.minutes;
+  const isOvernightSchedule = endMins <= startMins;
+
+  const sameDayEndRealMs =
+    Date.UTC(inDate.year, inDate.month - 1, inDate.day, endP.hours, endP.minutes, 0) -
+    UZ_OFFSET_MS;
+
+  let shiftEndRealMs = sameDayEndRealMs;
+  let isOvertimeCheckIn = false;
+
+  if (isOvernightSchedule) {
+    // Tungi smena (masalan 20:00 - 08:00): agar 00:00 dan keyin 08:00 gacha kirgan bo'lsa shu kungi 08:00, aks holda ertangi 08:00
+    if (checkInRealMs < sameDayEndRealMs && sameDayEndRealMs - checkInRealMs <= 16 * 3600000) {
+      shiftEndRealMs = sameDayEndRealMs;
+    } else {
+      shiftEndRealMs = sameDayEndRealMs + 24 * 3600000;
+    }
+  } else {
+    // Kunduzgi smena: agar xodim do'kon yopilishidan kamida 15 daqiqa oldin kelgan bo'lsa — rejadagi tugash vaqti
+    if (checkInRealMs <= sameDayEndRealMs - 15 * 60000) {
+      shiftEndRealMs = sameDayEndRealMs;
+    } else {
+      // Yopilishga yaqin yoki undan keyin qo'shimcha ishga kelgan — hech qachon orqaga (kelishdan oldingi vaqtga) yopmaymiz!
+      isOvertimeCheckIn = true;
+      const plannedMs = Math.max(4 * 3600000, Math.min((endMins - startMins) * 60000, 10 * 3600000));
+      shiftEndRealMs = checkInRealMs + plannedMs;
+    }
+  }
+
+  const endRefDate = new Date(shiftEndRealMs);
+  return {
+    checkInRealMs,
+    shiftEndRealMs,
+    endDateStr: getTashkentDateString(endRefDate),
+    endTimeStr: getTashkentTimeString(endRefDate, true),
+    isOvertimeCheckIn,
+  };
+}
+
+

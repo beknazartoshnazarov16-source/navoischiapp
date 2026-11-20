@@ -903,6 +903,8 @@ export function App() {
       chargeable_late_minutes: computedChargeableMinutes,
       late_penalty: computedLatePenalty,
       note: autoReason ? `Avtomatik ketish: ${autoReason}` : targetAtt.note,
+      auto_checkout_source: autoReason ? 'geofence' : undefined,
+      needs_admin_review: false,
     };
 
     setAttendances((prev) =>
