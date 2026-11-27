@@ -78,6 +78,7 @@ export function App() {
   });
 
   const [isCloudConnected, setIsCloudConnected] = useState<boolean>(true);
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
 
   // Maxfiy kalit nomi yangilandi (avvalgi xato tufayli boshqa qurilmalarda qolib ketgan eski admin keshlarini 100% tozalash uchun)
   const ADMIN_AUTH_STORAGE_KEY = 'navo_verified_admin_v2';
@@ -217,8 +218,23 @@ export function App() {
   // 1. CLOUD FIRESTORE REAL-TIME SYNCHRONIZATION
   useEffect(() => {
     initTelegramApp();
+    let usersLoaded = false;
+    let attLoaded = false;
+
+    const checkLoadingDone = () => {
+      if (usersLoaded && attLoaded) {
+        setIsInitialLoading(false);
+      }
+    };
+
+    const safetyTimer = setTimeout(() => {
+      setIsInitialLoading(false);
+    }, 1500);
+
     const unsubUsers = subscribeToUsers(
       (cloudUsers) => {
+        usersLoaded = true;
+        checkLoadingDone();
         if (cloudUsers && cloudUsers.length > 0) {
           setUsers(cloudUsers);
           localStorage.setItem('navo_time_users', JSON.stringify(cloudUsers));
@@ -291,17 +307,23 @@ export function App() {
         setIsCloudConnected(true);
       },
       (err) => {
+        usersLoaded = true;
+        checkLoadingDone();
         console.error('Firestore users sync error:', err);
       }
     );
 
     const unsubAttendance = subscribeToAttendance(
       (cloudAtt) => {
+        attLoaded = true;
+        checkLoadingDone();
         setAttendances(cloudAtt);
         localStorage.setItem('navo_time_attendances', JSON.stringify(cloudAtt));
         setIsCloudConnected(true);
       },
       (err) => {
+        attLoaded = true;
+        checkLoadingDone();
         console.error('Firestore attendance sync error:', err);
       }
     );
@@ -317,6 +339,7 @@ export function App() {
     );
 
     return () => {
+      clearTimeout(safetyTimer);
       unsubUsers();
       unsubAttendance();
       unsubSettings();
@@ -950,6 +973,32 @@ export function App() {
 
     sendNotification(publicMsg, adminMsg);
   };
+
+  if (isInitialLoading) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gradient-to-br from-emerald-700 via-emerald-800 to-emerald-950 text-white font-sans">
+        <div className="relative flex flex-col items-center px-6 text-center">
+          <div className="absolute -inset-6 rounded-full bg-emerald-400/20 blur-2xl animate-pulse"></div>
+          <div className="relative w-24 h-24 bg-white/10 backdrop-blur-xl rounded-3xl flex items-center justify-center border border-white/20 shadow-2xl mb-6 transform hover:scale-105 transition-transform">
+            <svg className="w-12 h-12 text-emerald-300 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+            </svg>
+          </div>
+          <h1 className="text-3xl font-black tracking-wider mb-2 text-white drop-shadow-lg">
+            NAVO MARKET
+          </h1>
+          <p className="text-emerald-200 text-sm font-medium tracking-wide mb-8 max-w-xs">
+            Bulutli ma'lumotlar bazasi va xodimlar davomati yuklanmoqda...
+          </p>
+          <div className="flex space-x-3">
+            <div className="w-3.5 h-3.5 bg-emerald-400 rounded-full animate-bounce shadow-lg" style={{ animationDelay: '0s' }}></div>
+            <div className="w-3.5 h-3.5 bg-emerald-300 rounded-full animate-bounce shadow-lg" style={{ animationDelay: '0.2s' }}></div>
+            <div className="w-3.5 h-3.5 bg-emerald-200 rounded-full animate-bounce shadow-lg" style={{ animationDelay: '0.4s' }}></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Agar foydalanuvchi hali kirmagan bo'lsa (yoki Chiqish bosgan bo'lsa), LoginScreen ko'rsatamiz!
   if (!currentUser) {
